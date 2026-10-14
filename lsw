@@ -550,11 +550,21 @@ vm_stop() {
 # VM, созданные без общей папки, не имеют записи в fstab — дописываем и монтируем
 ensure_mount() {
 	[[ $TYPE == linux && -n $SHARE ]] || return 0
+	local link
+	link=$(basename "$SHARE")
 	ssh_opts
-	"${SSH[@]}" "$VMUSER@127.0.0.1" 'mountpoint -q /mnt/host && exit 0
-sudo mkdir -p /mnt/host
-grep -q " /mnt/host " /etc/fstab || echo "host /mnt/host virtiofs defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
-sudo mount /mnt/host' </dev/null >/dev/null 2>&1 ||
+	# плюс ссылка ~/<имя папки> -> /mnt/host, чтобы папку было видно сразу в домашнем каталоге
+	"${SSH[@]}" "$VMUSER@127.0.0.1" "link=$(printf %q "$link")"'
+if ! mountpoint -q /mnt/host; then
+	sudo mkdir -p /mnt/host
+	grep -q " /mnt/host " /etc/fstab || echo "host /mnt/host virtiofs defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
+	sudo mount /mnt/host || exit 1
+fi
+for l in ~/* ~/.[!.]*; do
+	[ -L "$l" ] && [ "$(readlink "$l")" = /mnt/host ] && [ "$l" != ~/"$link" ] && rm -f "$l"
+done
+[ -e ~/"$link" ] || [ -L ~/"$link" ] || ln -s /mnt/host ~/"$link"
+exit 0' </dev/null >/dev/null 2>&1 ||
 		warn "общая папка не смонтировалась — перезапусти VM: lsw restart $NAME"
 }
 
@@ -812,7 +822,7 @@ cmd_share() { # [имя] [DIR[:ro]|off]
 		parse_share "$spec"
 		conf_set SHARE "$PSHARE"
 		conf_set SHARE_RO "$PSHARE_RO"
-		info "$NAME: $PSHARE -> /mnt/host$([[ $PSHARE_RO == 1 ]] && echo ' (только чтение)')"
+		info "$NAME: $PSHARE -> ~/$(basename "$PSHARE") в госте (/mnt/host)$([[ $PSHARE_RO == 1 ]] && echo ', только чтение')"
 	fi
 	is_running || return 0
 	if [[ -t 0 ]]; then
@@ -821,7 +831,7 @@ cmd_share() { # [имя] [DIR[:ro]|off]
 		if [[ $a != [nNнН]* ]]; then
 			vm_stop && vm_start && { wait_ssh 180 || warn "ssh пока не отвечает"; }
 			ensure_mount
-			[[ -z $SHARE ]] || info "в госте: /mnt/host"
+			[[ -z $SHARE ]] || info "в госте: ~/$(basename "$SHARE") (= /mnt/host)"
 			return 0
 		fi
 	fi
