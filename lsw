@@ -526,6 +526,7 @@ cmd_install() {
 		win_check_iso "$iso"
 	else
 		distro_url "$distro" >/dev/null || die "неизвестный дистрибутив: $distro"
+		[[ -z $iso ]] || die "--iso пока работает только для windows; Linux ставится из готового cloud-образа (без ISO)"
 	fi
 	name=${name:-$distro}
 	[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "имя: только a-z, 0-9 и '-'"
