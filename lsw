@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+# lsw — WSL-подобные headless-VM для Linux на QEMU/KVM (гости: Ubuntu, Arch, Windows 10)
+set -euo pipefail
+
+LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
+VMS=$LSW_HOME/vms
+CACHE=$LSW_HOME/cache
+KEY=$LSW_HOME/id_ed25519
+WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
+
+die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\e[1;34m::\e[0m %s\n' "$*" >&2; }
+warn() { printf '\e[1;33m!!\e[0m %s\n' "$*" >&2; }
+
+usage() {
+	cat <<'EOF'
+lsw — лёгкие терминальные виртуалки (Linux / Windows 10) на QEMU/KVM
+
+  lsw install <ubuntu|ubuntu-24.04|arch> [имя] [опции]
+  lsw install windows [имя] --iso Win10.iso [опции]
+      --cpus N        (linux 2, windows 4)
+      --mem  4G       (linux 2G, windows 4G)
+      --disk 40G      (linux 20G, windows 64G)
+      --share DIR     папка хоста в госте (по умолчанию $HOME); --no-share — без неё
+      --password P    пароль пользователя (по умолчанию = имя пользователя)
+      --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
+      --edition N     индекс редакции в install.wim/esd
+      --vnc           включить VNC 127.0.0.1:59xx (посмотреть, что с установкой Windows)
+
+  lsw                       shell в VM по умолчанию
+  lsw shell [имя]           терминал гостя (VM запустится сама)
+  lsw run <имя> -- cmd...   выполнить команду в госте
+  lsw list                  список VM
+  lsw start|stop|restart <имя>
+  lsw stop --all
+  lsw console <имя>         серийная консоль (выход: Ctrl+])
+  lsw logs <имя>            лог консоли
+  lsw default <имя>         VM по умолчанию
+  lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
+  lsw rm <имя> [-f]         удалить VM
+  lsw pull <дистрибутив>    перекачать базовый образ
+  lsw deps                  проверить зависимости
+EOF
+}
+
+# ---------- зависимости ----------
+
+find_virtiofsd() {
+	command -v virtiofsd 2>/dev/null && return
+	local p
+	for p in /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
+		[[ -x $p ]] && { echo "$p"; return; }
+	done
+	return 1
+}
+
+cmd_deps() {
+	local missing=() c
+	for c in qemu-system-x86_64 qemu-img xorriso socat ssh ssh-keygen curl; do
+		command -v "$c" >/dev/null || missing+=("$c")
+	done
+	find_virtiofsd >/dev/null || missing+=(virtiofsd)
+	[[ -w /dev/kvm ]] || warn "/dev/kvm недоступен для записи — без KVM будет очень медленно"
+	if ((${#missing[@]})); then
+		warn "не хватает: ${missing[*]}"
+		if command -v apt-get >/dev/null; then
+			echo "  sudo apt install qemu-system-x86 qemu-utils ipxe-qemu virtiofsd xorriso socat openssh-client curl" >&2
+		elif command -v dnf >/dev/null; then
+			echo "  sudo dnf install qemu-kvm qemu-img virtiofsd xorriso socat openssh-clients curl" >&2
+		else
+			echo "  sudo pacman -S --needed qemu-base libisoburn socat openssh curl" >&2
+		fi
+		[[ ${1:-} == quiet ]] && exit 1
+		return 1
+	fi
+	[[ ${1:-} == quiet ]] || info "все зависимости на месте"
+}
+
+ensure_key() {
+	[[ -f $KEY ]] || ssh-keygen -q -t ed25519 -N '' -C lsw -f "$KEY"
+}
+
+# ---------- VM: конфиг и состояние ----------
+
+vm_dir() { echo "$VMS/$1"; }
+
+load_vm() {
+	NAME=$1
+	DIR=$(vm_dir "$NAME")
+	[[ -f $DIR/vm.conf ]] || die "VM '$NAME' не найдена (lsw list)"
+	# shellcheck disable=SC1091
+	source "$DIR/vm.conf"
+}
+
+conf_set() { # key value
+	if grep -q "^$1=" "$DIR/vm.conf"; then
+		sed -i "s|^$1=.*|$1=$(printf %q "$2")|" "$DIR/vm.conf"
+	else
+		printf '%s=%q\n' "$1" "$2" >>"$DIR/vm.conf"
+	fi
+}
+
+default_vm() {
+	if [[ -f $LSW_HOME/default ]]; then cat "$LSW_HOME/default"; fi
+}
+
+resolve_name() { # [имя] -> имя, иначе VM по умолчанию
+	local n=${1:-$(default_vm)}
+	[[ -n $n ]] || die "не указано имя VM и нет VM по умолчанию (lsw default <имя>)"
+	echo "$n"
+}
+
+qemu_pid() {
+	local pid
+	[[ -f $DIR/qemu.pid ]] || return 1
+	pid=$(<"$DIR/qemu.pid")
+	[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && grep -q qemu "/proc/$pid/comm" 2>/dev/null || return 1
+	echo "$pid"
+}
+
+is_running() { qemu_pid >/dev/null; }
+
+free_port() {
+	local p=2222 used
+	used=$(sed -n 's/^PORT=//p' "$VMS"/*/vm.conf 2>/dev/null || true)
+	while grep -qx "$p" <<<"$used" || ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; do
+		((p++))
+	done
+	echo "$p"
+}
+
+# ---------- ssh ----------
+
+ssh_opts() {
+	SSH=(ssh -i "$KEY" -p "$PORT"
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+		-o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30)
+}
+
+ssh_ready() {
+	ssh_opts
+	"${SSH[@]}" -o ConnectTimeout=3 "$VMUSER@127.0.0.1" exit </dev/null >/dev/null 2>&1
+}
+
+wait_ssh() { # таймаут в секундах
+	local deadline=$((SECONDS + ${1:-180}))
+	until ssh_ready; do
+		is_running || die "VM '$NAME' остановилась (lsw logs $NAME)"
+		((SECONDS < deadline)) || return 1
+		sleep 2
+	done
+}
+
+# ---------- образы ----------
+
+distro_url() {
+	case $1 in
+	ubuntu | ubuntu-26.04) echo https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img ;;
+	ubuntu-24.04) echo https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img ;;
+	arch) echo https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2 ;;
+	*) return 1 ;;
+	esac
+}
+
+pull_image() { # distro [force]
+	local url f
+	url=$(distro_url "$1") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, arch, windows)"
+	f=$CACHE/$1.img
+	if [[ ! -f $f || ${2:-} == force ]]; then
+		mkdir -p "$CACHE"
+		info "скачиваю $1: $url"
+		curl -fL --progress-bar -o "$f.part" "$url" || die "не удалось скачать образ"
+		mv "$f.part" "$f"
+	fi
+	echo "$f"
+}
+
+img_format() { qemu-img info "$1" | awk -F': ' '/^file format/ {print $2}'; }
+
+mkiso() { # dir out label
+	xorriso -as mkisofs -o "$2" -V "$3" -J -r "$1" >/dev/null 2>&1 || die "xorriso не смог собрать $2"
+}
+
+# ---------- Linux-гость ----------
+
+make_seed() {
+	local d=$DIR/seed pass
+	pass=$(<"$DIR/password")
+	rm -rf "$d" && mkdir -p "$d"
+	printf 'instance-id: %s\nlocal-hostname: %s\n' "$NAME-$(date +%s)" "$NAME" >"$d/meta-data"
+	{
+		cat <<EOF
+#cloud-config
+hostname: $NAME
+users:
+  - name: $VMUSER
+    gecos: $VMUSER
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    plain_text_passwd: '$pass'
+    ssh_authorized_keys:
+      - $(<"$KEY.pub")
+ssh_pwauth: false
+growpart: {mode: auto, devices: ['/']}
+EOF
+		if [[ -n $SHARE ]]; then
+			cat <<'EOF'
+runcmd:
+  - mkdir -p /mnt/host
+  - grep -q ' /mnt/host ' /etc/fstab || echo 'host /mnt/host virtiofs defaults,nofail 0 0' >> /etc/fstab
+  - mount /mnt/host || true
+EOF
+		fi
+	} >"$d/user-data"
+	mkiso "$d" "$DIR/seed.iso" cidata
+}
+
+start_virtiofsd() {
+	local bin lim
+	bin=$(find_virtiofsd) || die "virtiofsd не найден (или используй --no-share)"
+	[[ -d $SHARE ]] || die "папка для общего доступа не существует: $SHARE"
+	rm -f "$DIR/vfs.sock"
+	lim=$(ulimit -Hn)
+	[[ $lim =~ ^[0-9]+$ ]] || lim=1048576
+	setsid "$bin" --socket-path="$DIR/vfs.sock" --shared-dir="$SHARE" \
+		--sandbox=none --cache=auto --rlimit-nofile="$lim" \
+		>"$DIR/virtiofsd.log" 2>&1 </dev/null &
+	echo $! >"$DIR/virtiofsd.pid"
+	local i
+	for i in {1..50}; do
+		[[ -S $DIR/vfs.sock ]] && return
+		sleep 0.1
+	done
+	die "virtiofsd не запустился: $(tail -3 "$DIR/virtiofsd.log")"
+}
+
+linux_args() {
+	ARGS+=(-cpu host
+		-drive "file=$DIR/disk.qcow2,if=virtio,discard=unmap,detect-zeroes=unmap"
+		-drive "file=$DIR/seed.iso,if=virtio,format=raw,readonly=on"
+		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
+		-device virtio-net-pci,netdev=n0
+		-device virtio-balloon-pci,free-page-reporting=on
+		-device virtio-rng-pci
+		-vga none)
+	if [[ -n $SHARE ]]; then
+		start_virtiofsd
+		ARGS+=(-object "memory-backend-memfd,id=mem,size=$MEM,share=on" -numa node,memdev=mem
+			-chardev "socket,id=vfs,path=$DIR/vfs.sock"
+			-device vhost-user-fs-pci,chardev=vfs,tag=host)
+	fi
+}
+
+# ---------- Windows-гость ----------
+
+win_lang() { # iso -> en-US / ru-RU / ...
+	local tmp lang
+	tmp=$(mktemp -d)
+	xorriso -osirrox on -indev "$1" -extract /sources/lang.ini "$tmp/lang.ini" >/dev/null 2>&1 || true
+	lang=$(awk -F= '/^\[Available UI Languages\]/ {f=1; next} /^\[/ {f=0} f && NF==2 {gsub(/[ \t\r]/, "", $1); print $1; exit}' \
+		"$tmp/lang.ini" 2>/dev/null || true)
+	rm -rf "$tmp"
+	echo "${lang:-en-US}"
+}
+
+win_check_iso() {
+	xorriso -indev "$1" -find /sources -name 'install.*' 2>/dev/null | grep -qE "install\.(wim|esd|swm)" ||
+		die "$1 не похож на установочный ISO Windows (нет sources/install.wim|esd)"
+}
+
+openssh_msi() {
+	local f=$CACHE/OpenSSH-Win64.msi url
+	if [[ ! -f $f ]]; then
+		url=$(curl -fsSL https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest |
+			grep -o 'https://[^"]*OpenSSH-Win64[^"]*\.msi' | head -1 || true)
+		if [[ -n $url ]]; then
+			info "скачиваю Win32-OpenSSH: $url"
+			mkdir -p "$CACHE"
+			curl -fL --progress-bar -o "$f.part" "$url" && mv "$f.part" "$f" || rm -f "$f.part"
+		fi
+	fi
+	[[ -f $f ]] && echo "$f" || true
+}
+
+make_win_cfg() { # iso lang key edition
+	local d=$DIR/wincfg lang=$2 key=$3 edition=$4 pass msi input from=''
+	pass=$(<"$DIR/password")
+	rm -rf "$d" && mkdir -p "$d"
+	cp "$KEY.pub" "$d/authorized_keys"
+	msi=$(openssh_msi)
+	if [[ -n $msi ]]; then cp "$msi" "$d/OpenSSH-Win64.msi"; else warn "MSI OpenSSH не скачан — гость поставит его из Windows Update"; fi
+	[[ $lang == en-US ]] && input=en-US || input="$lang;en-US"
+	[[ -n $edition ]] && from="<InstallFrom><MetaData wcm:action=\"add\"><Key>/IMAGE/INDEX</Key><Value>$edition</Value></MetaData></InstallFrom>"
+
+	local intl="<InputLocale>$input</InputLocale><SystemLocale>$lang</SystemLocale><UILanguage>$lang</UILanguage><UserLocale>$lang</UserLocale>"
+	local comp='processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"'
+	cat >"$d/autounattend.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" $comp>
+      <SetupUILanguage><UILanguage>$lang</UILanguage></SetupUILanguage>
+      $intl
+    </component>
+    <component name="Microsoft-Windows-Setup" $comp>
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Active>true</Active><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
+          $from
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <ProductKey><Key>$key</Key><WillShowUI>OnError</WillShowUI></ProductKey>
+      </UserData>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" $comp>
+      <ComputerName>$NAME</ComputerName>
+    </component>
+    <component name="Microsoft-Windows-Deployment" $comp>
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c "for %d in (D E F G H I J K) do if exist %d:\lsw-setup.ps1 (mkdir C:\lsw &amp; xcopy /y %d:\* C:\lsw\ &amp; mkdir C:\Windows\Setup\Scripts &amp; copy /y %d:\SetupComplete.cmd C:\Windows\Setup\Scripts\)"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" $comp>
+      $intl
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" $comp>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>$VMUSER</Name>
+            <DisplayName>$VMUSER</DisplayName>
+            <Group>Administrators</Group>
+            <Password><Value>$pass</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+    </component>
+  </settings>
+</unattend>
+EOF
+
+	printf '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File C:\\lsw\\lsw-setup.ps1\r\n' >"$d/SetupComplete.cmd"
+
+	# выполняется от SYSTEM в конце установки (SetupComplete.cmd)
+	sed -e "s|__USER__|$VMUSER|" -e "s|__PASS__|$pass|" >"$d/lsw-setup.ps1" <<'EOF'
+Start-Transcript C:\lsw\setup.log
+$user = '__USER__'
+$pass = ConvertTo-SecureString '__PASS__' -AsPlainText -Force
+
+# пользователь-администратор (по SID — работает в любой локализации)
+if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
+    New-LocalUser $user -Password $pass -PasswordNeverExpires
+}
+Set-LocalUser $user -PasswordNeverExpires $true
+Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $user -ErrorAction SilentlyContinue
+
+# OpenSSH Server
+if (Test-Path C:\lsw\OpenSSH-Win64.msi) {
+    Start-Process msiexec.exe -Wait -ArgumentList '/i C:\lsw\OpenSSH-Win64.msi /qn'
+} else {
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+}
+New-Item -ItemType Directory -Force C:\ProgramData\ssh | Out-Null
+Copy-Item C:\lsw\authorized_keys C:\ProgramData\ssh\administrators_authorized_keys -Force
+icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F'
+if (-not (Test-Path HKLM:\SOFTWARE\OpenSSH)) { New-Item HKLM:\SOFTWARE\OpenSSH | Out-Null }
+New-ItemProperty HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force `
+    -Value "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
+New-NetFirewallRule -Name lsw-sshd -DisplayName 'OpenSSH (lsw)' -Direction Inbound -Protocol TCP `
+    -LocalPort 22 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+Set-Service sshd -StartupType Automatic
+Start-Service sshd
+
+# headless: без сна и гибернации, SAC на COM1
+powercfg /hibernate off
+powercfg /change standby-timeout-ac 0
+powercfg /change monitor-timeout-ac 0
+bcdedit /ems '{current}' on
+bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200
+Stop-Transcript
+EOF
+	mkiso "$d" "$DIR/wincfg.iso" LSWCFG
+}
+
+windows_args() {
+	local net="user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
+	[[ -n $SHARE ]] && command -v smbd >/dev/null && net+=",smb=$SHARE" # \\10.0.2.4\qemu
+	ARGS+=(-cpu "${LSW_WIN_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic,hv_stimer}"
+		-rtc base=localtime
+		-drive "file=$DIR/disk.qcow2,if=none,id=d0,discard=unmap,detect-zeroes=unmap" -device ide-hd,drive=d0,bus=ide.0
+		-netdev "$net" -device e1000e,netdev=n0
+		-vga std)
+	if [[ $INSTALLED != 1 ]]; then
+		ARGS+=(-drive "file=$ISO,if=none,id=cd0,media=cdrom,readonly=on" -device ide-cd,drive=cd0,bus=ide.1
+			-drive "file=$DIR/wincfg.iso,if=none,id=cd1,media=cdrom,readonly=on" -device ide-cd,drive=cd1,bus=ide.2
+			-boot order=c,once=d)
+	fi
+}
+
+# ---------- запуск / остановка ----------
+
+vm_start() {
+	is_running && return
+	[[ -w /dev/kvm ]] || die "нет доступа к /dev/kvm"
+	rm -f "$DIR"/{qmp,console}.sock
+	ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm -smp "$CPUS" -m "$MEM"
+		-chardev "socket,id=con,path=$DIR/console.sock,server=on,wait=off,logfile=$DIR/console.log,logappend=on"
+		-serial chardev:con
+		-qmp "unix:$DIR/qmp.sock,server=on,wait=off"
+		-pidfile "$DIR/qemu.pid" -daemonize)
+	if [[ ${VNC:-} ]]; then ARGS+=(-vnc "127.0.0.1:$VNC"); else ARGS+=(-display none); fi
+	case $TYPE in
+	linux) linux_args ;;
+	windows) windows_args ;;
+	esac
+	info "запускаю $NAME"
+	"${ARGS[@]}" 2>"$DIR/qemu.log" || { stop_virtiofsd; die "QEMU не стартовал: $(tail -5 "$DIR/qemu.log")"; }
+}
+
+stop_virtiofsd() {
+	[[ -f $DIR/virtiofsd.pid ]] && kill "$(<"$DIR/virtiofsd.pid")" 2>/dev/null || true
+	rm -f "$DIR/virtiofsd.pid" "$DIR/vfs.sock"
+}
+
+qmp() {
+	printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1" |
+		socat -t2 - "UNIX-CONNECT:$DIR/qmp.sock" >/dev/null 2>&1 || true
+}
+
+vm_stop() {
+	local pid i
+	pid=$(qemu_pid) || { stop_virtiofsd; return 0; }
+	info "останавливаю $NAME"
+	qmp system_powerdown
+	for i in {1..90}; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		warn "гость не выключился за 90 с — выключаю принудительно"
+		qmp quit
+		sleep 1
+		kill "$pid" 2>/dev/null || true
+	fi
+	stop_virtiofsd
+	rm -f "$DIR/qemu.pid"
+}
+
+ensure_up() { # запустить при необходимости и дождаться ssh
+	[[ $INSTALLED == 1 ]] || die "'$NAME' ещё устанавливается (lsw list, lsw logs $NAME)"
+	if ! is_running; then vm_start; fi
+	ssh_ready && return
+	printf '\e[2m... жду %s\e[0m\n' "$NAME" >&2
+	wait_ssh 180 || die "ssh в '$NAME' не поднялся (lsw console $NAME)"
+}
+
+# ---------- команды ----------
+
+cmd_install() {
+	local distro=${1:-}
+	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
+	shift
+	local name='' cpus='' mem='' disk='' share=$HOME pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc=''
+	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
+	while (($#)); do
+		case $1 in
+		--cpus) cpus=$2; shift ;;
+		--mem) mem=$2; shift ;;
+		--disk) disk=$2; shift ;;
+		--share) share=$(realpath "$2"); shift ;;
+		--no-share) share='' ;;
+		--password) pass=$2; shift ;;
+		--iso) iso=$(realpath "$2"); shift ;;
+		--key) key=$2; shift ;;
+		--edition) edition=$2; shift ;;
+		--vnc) vnc=1 ;;
+		*) die "неизвестная опция: $1" ;;
+		esac
+		shift
+	done
+	cmd_deps quiet
+	ensure_key
+
+	local type=linux
+	if [[ $distro == windows ]]; then
+		type=windows
+		[[ -n $iso && -f $iso ]] || die "для Windows нужен --iso путь/к/Win10.iso"
+		win_check_iso "$iso"
+	else
+		distro_url "$distro" >/dev/null || die "неизвестный дистрибутив: $distro"
+	fi
+	name=${name:-$distro}
+	[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "имя: только a-z, 0-9 и '-'"
+	[[ ! -e $(vm_dir "$name") ]] || die "VM '$name' уже есть"
+	if [[ $type == windows ]]; then
+		: "${cpus:=4}" "${mem:=4G}" "${disk:=64G}"
+	else
+		: "${cpus:=2}" "${mem:=2G}" "${disk:=20G}"
+	fi
+
+	NAME=$name DIR=$(vm_dir "$name")
+	mkdir -p "$DIR"
+	trap '[[ -f $DIR/vm.conf ]] || rm -rf "$DIR"' EXIT
+	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
+	TYPE=$type DISTRO=$distro CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share ISO=$iso INSTALLED=0
+
+	if [[ $type == linux ]]; then
+		local base
+		base=$(pull_image "$distro")
+		info "готовлю диск $disk"
+		qemu-img convert -O qcow2 -f "$(img_format "$base")" "$base" "$DIR/disk.qcow2"
+		qemu-img resize -q "$DIR/disk.qcow2" "$disk"
+		make_seed
+	else
+		local lang
+		lang=$(win_lang "$iso")
+		info "Windows ISO: язык $lang"
+		make_win_cfg "$iso" "$lang" "$key" "$edition"
+		qemu-img create -q -f qcow2 "$DIR/disk.qcow2" "$disk"
+	fi
+
+	local v
+	{
+		for v in TYPE DISTRO CPUS MEM PORT VMUSER SHARE ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
+	} >"$DIR/vm.conf"
+	trap - EXIT
+	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
+
+	[[ -n $vnc ]] && VNC=$((PORT - 2222 + 10))
+	vm_start
+	[[ -n $vnc ]] && info "VNC: 127.0.0.1:$((5900 + VNC))"
+
+	if [[ $type == linux ]]; then
+		info "первая загрузка и cloud-init..."
+		wait_ssh 300 || die "гость не поднял ssh за 5 минут (lsw logs $name)"
+		ssh_opts
+		"${SSH[@]}" "$VMUSER@127.0.0.1" 'cloud-init status --wait >/dev/null 2>&1 || true'
+	else
+		info "установка Windows идёт без участия, обычно 15–40 минут (можно прервать Ctrl+C — VM продолжит работу)"
+		trap 'echo; info "VM ставится в фоне. Проверить: lsw list; когда будет готово: lsw shell $NAME"; exit 0' INT
+		local t0=$SECONDS
+		until ssh_ready; do
+			is_running || die "VM остановилась во время установки (попробуй --vnc, чтобы посмотреть экран)"
+			printf '\r  %3d мин  диск: %s   ' $(((SECONDS - t0) / 60)) "$(du -h "$DIR/disk.qcow2" | cut -f1)" >&2
+			sleep 10
+		done
+		echo >&2
+		trap - INT
+	fi
+	conf_set INSTALLED 1
+	info "готово: lsw shell $name   (пользователь $VMUSER, пароль в $DIR/password)"
+}
+
+cmd_list() {
+	local d n def state
+	def=$(default_vm)
+	printf '%-2s%-16s %-13s %-12s %-5s %-5s %s\n' '' NAME TYPE STATE CPUS MEM PORT
+	for d in "$VMS"/*/; do
+		[[ -f $d/vm.conf ]] || continue
+		n=$(basename "$d")
+		(
+			load_vm "$n"
+			if is_running; then
+				if [[ $INSTALLED == 1 ]]; then state=running; else state=installing; fi
+			else state=stopped; fi
+			printf '%-2s%-16s %-13s %-12s %-5s %-5s %s\n' "$([[ $n == "$def" ]] && echo '*')" "$n" "$DISTRO" "$state" "$CPUS" "$MEM" "$PORT"
+		)
+	done
+}
+
+cmd_shell() {
+	load_vm "$(resolve_name "${1:-}")"
+	ensure_up
+	ssh_opts
+	if [[ $TYPE == linux ]]; then
+		# как в WSL: открываемся в той же папке, если она внутри общей
+		local rel='' cd=''
+		if [[ -n $SHARE && ( $PWD == "$SHARE" || $PWD == "$SHARE"/* ) ]]; then
+			rel=${PWD#"$SHARE"}
+			cd="cd $(printf %q "/mnt/host$rel") 2>/dev/null;"
+		fi
+		exec "${SSH[@]}" -t "$VMUSER@127.0.0.1" "$cd exec \$SHELL -l"
+	else
+		exec "${SSH[@]}" -t "$VMUSER@127.0.0.1"
+	fi
+}
+
+cmd_run() {
+	local n=${1:-}
+	[[ -n $n ]] || die "lsw run <имя> -- команда"
+	shift
+	[[ ${1:-} == -- ]] && shift
+	(($#)) || die "не указана команда"
+	load_vm "$n"
+	ensure_up
+	ssh_opts
+	local tty=()
+	[[ -t 0 && -t 1 ]] && tty=(-t)
+	if [[ $TYPE == linux ]]; then
+		exec "${SSH[@]}" "${tty[@]}" "$VMUSER@127.0.0.1" "$(printf '%q ' "$@")"
+	else
+		exec "${SSH[@]}" "${tty[@]}" "$VMUSER@127.0.0.1" "$*"
+	fi
+}
+
+cmd_console() {
+	load_vm "$(resolve_name "${1:-}")"
+	is_running || die "'$NAME' не запущена"
+	info "консоль $NAME — выход Ctrl+]"
+	exec socat STDIO,rawer,escape=0x1d "UNIX-CONNECT:$DIR/console.sock"
+}
+
+cmd_ssh_config() {
+	local d n
+	ensure_key
+	for d in "$VMS"/*/; do
+		n=$(basename "$d")
+		[[ -z ${1:-} || $1 == "$n" ]] || continue
+		(
+			load_vm "$n"
+			printf 'Host lsw-%s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n\n' \
+				"$n" "$PORT" "$VMUSER" "$KEY"
+		)
+	done
+}
+
+cmd_rm() {
+	local n=${1:-} force=${2:-}
+	[[ -n $n ]] || die "lsw rm <имя>"
+	load_vm "$n"
+	if [[ $force != -f ]]; then
+		read -rp "Удалить VM '$n' вместе с диском? [y/N] " a
+		[[ $a == [yYдД]* ]] || exit 1
+	fi
+	vm_stop
+	rm -rf "$DIR"
+	[[ $(default_vm) == "$n" ]] && rm -f "$LSW_HOME/default"
+	info "удалена: $n"
+}
+
+main() {
+	mkdir -p "$VMS"
+	local c=${1:-}
+	(($#)) && shift
+	case $c in
+	'') [[ -n $(default_vm) ]] && cmd_shell || usage ;;
+	install | i) cmd_install "$@" ;;
+	list | ls) cmd_list ;;
+	shell | sh) cmd_shell "$@" ;;
+	run) cmd_run "$@" ;;
+	start) load_vm "${1:?имя}" && vm_start && { [[ $INSTALLED != 1 ]] || wait_ssh 180 || warn "ssh пока не отвечает"; } ;;
+	stop)
+		if [[ ${1:-} == --all ]]; then
+			local d
+			for d in "$VMS"/*/; do [[ -f $d/vm.conf ]] && (load_vm "$(basename "$d")" && vm_stop); done
+		else
+			load_vm "${1:?имя}" && vm_stop
+		fi
+		;;
+	restart) load_vm "${1:?имя}" && vm_stop && vm_start ;;
+	console) cmd_console "$@" ;;
+	logs) load_vm "$(resolve_name "${1:-}")" && tail -n "${2:-100}" -f "$DIR/console.log" ;;
+	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
+	ssh-config) cmd_ssh_config "$@" ;;
+	rm | remove) cmd_rm "$@" ;;
+	pull) pull_image "${1:?дистрибутив}" force >/dev/null ;;
+	deps) cmd_deps ;;
+	-h | --help | help) usage ;;
+	*) die "неизвестная команда: $c (lsw help)" ;;
+	esac
+}
+
+main "$@"
