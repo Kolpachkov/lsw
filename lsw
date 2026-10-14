@@ -17,6 +17,7 @@ usage() {
 lsw — лёгкие терминальные виртуалки (Linux / Windows 10) на QEMU/KVM
 
   lsw install <ubuntu|ubuntu-24.04|arch> [имя] [опции]
+  lsw install ubuntu  [имя] --iso ubuntu-XX.04-live-server-amd64.iso  (автоустановка с ISO)
   lsw install windows [имя] --iso Win10.iso [опции]
       --cpus N        (linux 2, windows 4)
       --mem  4G       (linux 2G, windows 4G)
@@ -185,14 +186,10 @@ mkiso() { # dir out label
 
 # ---------- Linux-гость ----------
 
-make_seed() {
-	local d=$DIR/seed pass
+cloud_body() { # cloud-config гостя без заголовка
+	local pass
 	pass=$(<"$DIR/password")
-	rm -rf "$d" && mkdir -p "$d"
-	printf 'instance-id: %s\nlocal-hostname: %s\n' "$NAME-$(date +%s)" "$NAME" >"$d/meta-data"
-	{
-		cat <<EOF
-#cloud-config
+	cat <<EOF
 hostname: $NAME
 users:
   - name: $VMUSER
@@ -206,17 +203,69 @@ users:
 ssh_pwauth: false
 growpart: {mode: auto, devices: ['/']}
 EOF
-		# в cloud-образе Ubuntu пустые списки apt; на Arch не делаем -Sy (частичное обновление)
-		[[ $DISTRO == ubuntu* ]] && echo 'package_update: true'
-		# запись в fstab есть всегда (nofail): папку можно включить позже через lsw share
-		cat <<'EOF'
+	# в cloud-образе Ubuntu пустые списки apt; на Arch не делаем -Sy (частичное обновление)
+	if [[ $DISTRO == ubuntu* ]]; then echo 'package_update: true'; fi
+	# запись в fstab есть всегда (nofail): папку можно включить позже через lsw share
+	cat <<'EOF'
 runcmd:
   - mkdir -p /mnt/host
   - grep -q ' /mnt/host ' /etc/fstab || echo 'host /mnt/host virtiofs defaults,nofail 0 0' >> /etc/fstab
   - mount /mnt/host || true
 EOF
-	} >"$d/user-data"
+}
+
+write_seed() { # user-data-файл -> seed.iso (метка cidata)
+	local d=$DIR/seed
+	rm -rf "$d" && mkdir -p "$d"
+	printf 'instance-id: %s\nlocal-hostname: %s\n' "$NAME-$(date +%s)" "$NAME" >"$d/meta-data"
+	cat >"$d/user-data"
 	mkiso "$d" "$DIR/seed.iso" cidata
+}
+
+make_seed() {
+	{ echo '#cloud-config'; cloud_body; } | write_seed
+}
+
+# Ubuntu Server ISO: subiquity autoinstall; cloud_body уходит в установленную систему
+make_autoinstall_seed() {
+	{
+		cat <<'EOF'
+#cloud-config
+autoinstall:
+  version: 1
+  refresh-installer: {update: false}
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  storage: {layout: {name: direct}}
+  ssh: {install-server: true, allow-pw: false}
+  late-commands:
+    - sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200"/' /target/etc/default/grub
+    - curtin in-target -- update-grub
+  shutdown: poweroff
+  user-data:
+EOF
+		cloud_body | sed 's/^/    /'
+	} | write_seed
+}
+
+ubuntu_iso_info() { # iso -> версия (24.04), только для Server ISO
+	local tmp info ver
+	tmp=$(mktemp -d)
+	xorriso -osirrox on -indev "$1" -extract /.disk/info "$tmp/info" >/dev/null 2>&1 || true
+	info=$(cat "$tmp/info" 2>/dev/null || true)
+	rm -rf "$tmp"
+	[[ -n $info ]] || die "$1 не похож на ISO Ubuntu (нет .disk/info)"
+	[[ $info == *Server* ]] || die "это не Server ISO ($info). Desktop ISO нельзя поставить без экрана — нужен *-live-server-amd64.iso"
+	ver=$(grep -oE '[0-9]{2}\.[0-9]{2}' <<<"$info" | head -1)
+	echo "${ver:-iso}"
+}
+
+extract_kernel() { # iso -> $DIR/boot/{vmlinuz,initrd}
+	mkdir -p "$DIR/boot"
+	xorriso -osirrox on -indev "$1" -extract /casper/vmlinuz "$DIR/boot/vmlinuz" \
+		-extract /casper/initrd "$DIR/boot/initrd" >/dev/null 2>&1 ||
+		die "не нашёл /casper/vmlinuz и initrd в ISO"
+	chmod u+w "$DIR/boot"/*
 }
 
 start_virtiofsd() {
@@ -251,7 +300,10 @@ linux_args() {
 		-device virtio-balloon-pci,free-page-reporting=on
 		-device virtio-rng-pci
 		-vga none)
-	if [[ -n $SHARE ]]; then
+	if [[ -n ${ISO:-} && $INSTALLED != 1 ]]; then # установщик Ubuntu Server
+		ARGS+=(-cdrom "$ISO" -kernel "$DIR/boot/vmlinuz" -initrd "$DIR/boot/initrd"
+			-append "autoinstall ds=nocloud console=ttyS0,115200" -no-reboot)
+	elif [[ -n $SHARE ]]; then
 		start_virtiofsd
 		ARGS+=(-object "memory-backend-memfd,id=mem,size=$MEM,share=on" -numa node,memdev=mem
 			-chardev "socket,id=vfs,path=$DIR/vfs.sock"
@@ -441,7 +493,9 @@ vm_start() {
 	is_running && return
 	[[ -w /dev/kvm ]] || die "нет доступа к /dev/kvm"
 	rm -f "$DIR"/{qmp,console}.sock
-	ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm -smp "$CPUS" -m "$MEM"
+	local mem=$MEM
+	if [[ $TYPE == linux && -n ${ISO:-} && $INSTALLED != 1 ]] && (($(mem_mb "$MEM") < 4096)); then mem=4G; fi
+	ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm -smp "$CPUS" -m "$mem"
 		-chardev "socket,id=con,path=$DIR/console.sock,server=on,wait=off,logfile=$DIR/console.log,logappend=on"
 		-serial chardev:con
 		-qmp "unix:$DIR/qmp.sock,server=on,wait=off"
@@ -453,6 +507,15 @@ vm_start() {
 	esac
 	info "запускаю $NAME"
 	"${ARGS[@]}" 2>"$DIR/qemu.log" || { stop_virtiofsd; die "QEMU не стартовал: $(tail -5 "$DIR/qemu.log")"; }
+}
+
+mem_mb() { # 2G / 2048M / 2048 -> МБ
+	local v=${1^^}
+	case $v in
+	*G) echo $((${v%G} * 1024)) ;;
+	*M) echo "${v%M}" ;;
+	*) echo "$v" ;;
+	esac
 }
 
 stop_virtiofsd() {
@@ -526,7 +589,14 @@ cmd_install() {
 		win_check_iso "$iso"
 	else
 		distro_url "$distro" >/dev/null || die "неизвестный дистрибутив: $distro"
-		[[ -z $iso ]] || die "--iso пока работает только для windows; Linux ставится из готового cloud-образа (без ISO)"
+		if [[ -n $iso ]]; then
+			[[ $distro == ubuntu* ]] || die "--iso для Linux поддерживается только для Ubuntu Server"
+			[[ -f $iso ]] || die "нет файла $iso"
+			local ver
+			ver=$(ubuntu_iso_info "$iso")
+			distro=ubuntu-$ver
+			name=${name:-ubuntu-${ver//./}}
+		fi
 	fi
 	name=${name:-$distro}
 	[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "имя: только a-z, 0-9 и '-'"
@@ -543,7 +613,12 @@ cmd_install() {
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
 	TYPE=$type DISTRO=$distro CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
 
-	if [[ $type == linux ]]; then
+	if [[ $type == linux && -n $iso ]]; then
+		info "Ubuntu Server ISO ($distro), диск $disk"
+		extract_kernel "$iso"
+		qemu-img create -q -f qcow2 "$DIR/disk.qcow2" "$disk"
+		make_autoinstall_seed
+	elif [[ $type == linux ]]; then
 		local base
 		base=$(pull_image "$distro")
 		info "готовлю диск $disk"
@@ -570,6 +645,10 @@ cmd_install() {
 	[[ -n $vnc ]] && info "VNC: 127.0.0.1:$((5900 + VNC))"
 
 	if [[ $type == linux ]]; then
+		if [[ -n $ISO ]]; then
+			install_from_iso
+			vm_start
+		fi
 		info "первая загрузка и cloud-init..."
 		wait_ssh 300 || die "гость не поднял ssh за 5 минут (lsw logs $name)"
 		ssh_opts
@@ -588,6 +667,30 @@ cmd_install() {
 	fi
 	conf_set INSTALLED 1
 	info "готово: lsw shell $name   (пользователь $VMUSER, пароль в $DIR/password)"
+}
+
+# установщик сам выключает VM (shutdown: poweroff); показываем прогресс по серийной консоли
+install_from_iso() {
+	info "автоустановка Ubuntu Server, обычно 5–15 минут (Ctrl+C — прервать и удалить VM)"
+	trap 'echo; qmp quit; sleep 1; rm -rf "$DIR"; [[ $(default_vm) == "$NAME" ]] && rm -f "$LSW_HOME/default"; die "установка прервана, VM удалена"' INT
+	local t0=$SECONDS cols line
+	cols=$(( $(tput cols 2>/dev/null || echo 80) - 22 ))
+	while is_running; do
+		line=$(tail -c 4096 "$DIR/console.log" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr '\r' '\n' |
+			grep -E '[[:alnum:]]' | tail -1 | cut -c1-"$cols" || true)
+		printf '\r\e[K  %3d мин  %s' $(((SECONDS - t0) / 60)) "$line" >&2
+		(((SECONDS - t0) < 3600)) || { echo >&2; qmp quit; die "установка идёт больше часа — смотри $DIR/console.log"; }
+		sleep 3
+	done
+	printf '\r\e[K' >&2
+	trap - INT
+	rm -f "$DIR/qemu.pid"
+	# дальше — обычная загрузка с диска, установщик больше не нужен
+	conf_set ISO ''
+	ISO=''
+	rm -rf "$DIR/boot"
+	make_seed
+	info "установка завершена, загружаю систему"
 }
 
 cmd_list() {
