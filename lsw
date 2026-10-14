@@ -6,6 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
+LSW_VERSION=0.3.0
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
 die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
@@ -44,6 +45,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
   lsw rm <имя> [-f]         удалить VM
   lsw pull <дистрибутив>    перекачать базовый образ
   lsw deps                  проверить зависимости
+  lsw version               версия и путь к скрипту
 EOF
 }
 
@@ -347,8 +349,12 @@ win_lang() { # iso -> en-US / ru-RU / ...
 win_check_iso() {
 	local z
 	if z=$(find_7z); then
-		"$z" l -ba "$1" 'sources/install.*' 2>/dev/null | grep -qiE 'install\.(wim|esd|swm)' ||
-			die "$1 не похож на установочный ISO Windows (нет sources/install.wim|esd)"
+		local list
+		list=$("$z" l -ba "$1" 2>&1 || true)
+		grep -qiE 'sources[/\\]install\.(wim|esd|swm)' <<<"$list" || {
+			printf '%s\n' "$list" | head -15 >&2
+			die "$1: $z не нашёл в ISO sources/install.wim|esd (выше — что он видит). Размер файла: $(du -h "$1" | cut -f1)"
+		}
 	else
 		warn "7z не установлен — не могу заглянуть внутрь ISO (UDF), проверку пропускаю"
 		warn "  лучше поставить: sudo pacman -S 7zip  /  sudo apt install 7zip"
@@ -908,6 +914,7 @@ main() {
 	rm | remove) cmd_rm "$@" ;;
 	pull) pull_image "${1:?дистрибутив}" force >/dev/null ;;
 	deps) cmd_deps ;;
+	version | --version | -V) echo "lsw $LSW_VERSION ($(readlink -f "$0"))" ;;
 	-h | --help | help) usage ;;
 	*) die "неизвестная команда: $c (lsw help)" ;;
 	esac
