@@ -48,7 +48,14 @@ fi
 info "ставлю: ${pkgs[*]}"
 $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
 
-install -Dm755 "$SRC/lsw" "$PREFIX/bin/lsw"
+mkdir -p "$PREFIX/bin"
+if [[ -d $SRC/.git ]]; then
+	# из git-клона — ссылка, чтобы git pull сразу обновлял lsw
+	ln -sfn "$SRC/lsw" "$PREFIX/bin/lsw"
+else
+	rm -f "$PREFIX/bin/lsw"
+	install -m755 "$SRC/lsw" "$PREFIX/bin/lsw"
+fi
 [[ -f $SRC/README.md ]] && install -Dm644 "$SRC/README.md" "$PREFIX/share/doc/lsw/README.md"
 info "lsw установлен в $PREFIX/bin/lsw"
 
