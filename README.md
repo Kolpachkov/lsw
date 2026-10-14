@@ -13,7 +13,7 @@ tar xzf lsw-ubuntu.tar.gz && cd lsw && ./install.sh   # потом перело�
 
 **Arch:**
 ```sh
-sudo pacman -S --needed qemu-base libisoburn socat
+sudo pacman -S --needed qemu-base libisoburn socat 7zip
 git clone https://github.com/Kolpachkov/lsw ~/lsw && ln -s ~/lsw/lsw ~/.local/bin/lsw
 ```
 
@@ -87,6 +87,9 @@ lsw достаёт из ISO ядро, грузит установщик с `auto
 
 - Нужен свой ISO Windows 10 ([официальная загрузка Microsoft](https://www.microsoft.com/software-download/windows10)).
   Язык установки определяется по `sources/lang.ini`.
+- ISO Microsoft записаны в UDF, их читает только `7z` (пакет `7zip`). Без него lsw не проверит ISO и
+  определит язык по имени файла (`ru_windows_…`, `…_Russian_…`), либо задай `--lang ru-RU`.
+- Поддерживается Windows 10 любого билда, включая первый 10240. Windows 11 пока нет (нужны UEFI + TPM).
 - Редакция выбирается generic-ключом Pro (установка без активации). Свой ключ — `--key`, другая редакция — `--edition N`
   (индекс в `install.wim`/`esd`, посмотреть: `wiminfo` из `wimlib`).
 - Посмотреть экран установки, если что-то пошло не так: `lsw install windows --iso ... --vnc`, затем

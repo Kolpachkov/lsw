@@ -27,6 +27,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --password P    пароль пользователя (по умолчанию = имя пользователя)
       --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
       --edition N     индекс редакции в install.wim/esd
+      --lang ru-RU    язык ISO Windows (обычно определяется сам)
       --vnc           включить VNC 127.0.0.1:59xx (посмотреть, что с установкой Windows)
 
   lsw                       shell в VM по умолчанию
@@ -71,12 +72,14 @@ cmd_deps() {
 		elif command -v dnf >/dev/null; then
 			echo "  sudo dnf install qemu-kvm qemu-img virtiofsd xorriso socat openssh-clients curl" >&2
 		else
-			echo "  sudo pacman -S --needed qemu-base libisoburn socat openssh curl" >&2
+			echo "  sudo pacman -S --needed qemu-base libisoburn socat 7zip openssh curl" >&2
 		fi
 		[[ ${1:-} == quiet ]] && exit 1
 		return 1
 	fi
-	[[ ${1:-} == quiet ]] || info "все зависимости на месте"
+	[[ ${1:-} == quiet ]] && return
+	find_7z >/dev/null || warn "для Windows желателен 7z (читает ISO Microsoft): sudo pacman -S 7zip / sudo apt install 7zip"
+	info "все зависимости на месте"
 }
 
 ensure_key() {
@@ -313,19 +316,43 @@ linux_args() {
 
 # ---------- Windows-гость ----------
 
+# ISO Windows — UDF: в ISO9660-части только README.TXT, xorriso их не читает, нужен 7z
+find_7z() { command -v 7z 2>/dev/null || command -v 7zz 2>/dev/null || command -v 7za 2>/dev/null; }
+
 win_lang() { # iso -> en-US / ru-RU / ...
-	local tmp lang
-	tmp=$(mktemp -d)
-	xorriso -osirrox on -indev "$1" -extract /sources/lang.ini "$tmp/lang.ini" >/dev/null 2>&1 || true
-	lang=$(awk -F= '/^\[Available UI Languages\]/ {f=1; next} /^\[/ {f=0} f && NF==2 {gsub(/[ \t\r]/, "", $1); print $1; exit}' \
-		"$tmp/lang.ini" 2>/dev/null || true)
-	rm -rf "$tmp"
-	echo "${lang:-en-US}"
+	local iso=$1 lang='' z tmp
+	if z=$(find_7z); then
+		lang=$("$z" e -so "$iso" sources/lang.ini 2>/dev/null |
+			awk -F= '/^\[Available UI Languages\]/ {f=1; next} /^\[/ {f=0} f && NF==2 {gsub(/[ \t\r]/, "", $1); print $1; exit}' || true)
+	fi
+	if [[ -z $lang ]]; then # по имени файла: ru_windows_10_..., Win10_22H2_Russian_x64.iso
+		local f=${iso##*/}
+		f=${f,,}
+		case $f in
+		ru_* | *russian*) lang=ru-RU ;;
+		uk_* | *ukrainian*) lang=uk-UA ;;
+		en-gb_* | *englishinternational*) lang=en-GB ;;
+		de_* | *german*) lang=de-DE ;;
+		fr_* | *french*) lang=fr-FR ;;
+		es_* | *spanish*) lang=es-ES ;;
+		it_* | *italian*) lang=it-IT ;;
+		pl_* | *polish*) lang=pl-PL ;;
+		*) lang=en-US ;;
+		esac
+		warn "язык ISO не прочитан (нет 7z) — по имени файла: $lang. Если не так: --lang ru-RU"
+	fi
+	echo "$lang"
 }
 
 win_check_iso() {
-	xorriso -indev "$1" -find /sources -name 'install.*' 2>/dev/null | grep -qE "install\.(wim|esd|swm)" ||
-		die "$1 не похож на установочный ISO Windows (нет sources/install.wim|esd)"
+	local z
+	if z=$(find_7z); then
+		"$z" l -ba "$1" 'sources/install.*' 2>/dev/null | grep -qiE 'install\.(wim|esd|swm)' ||
+			die "$1 не похож на установочный ISO Windows (нет sources/install.wim|esd)"
+	else
+		warn "7z не установлен — не могу заглянуть внутрь ISO (UDF), проверку пропускаю"
+		warn "  лучше поставить: sudo pacman -S 7zip  /  sudo apt install 7zip"
+	fi
 }
 
 openssh_msi() {
@@ -435,14 +462,15 @@ EOF
 	sed -e "s|__USER__|$VMUSER|" -e "s|__PASS__|$pass|" >"$d/lsw-setup.ps1" <<'EOF'
 Start-Transcript C:\lsw\setup.log
 $user = '__USER__'
-$pass = ConvertTo-SecureString '__PASS__' -AsPlainText -Force
+$pass = '__PASS__'
 
-# пользователь-администратор (по SID — работает в любой локализации)
-if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
-    New-LocalUser $user -Password $pass -PasswordNeverExpires
-}
-Set-LocalUser $user -PasswordNeverExpires $true
-Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $user -ErrorAction SilentlyContinue
+# пользователь-администратор; net user / net localgroup есть во всех билдах
+# (New-LocalUser появился только в 1607), группа — по SID, работает в любой локализации
+net user $user 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { net user $user $pass /add }
+wmic useraccount where "name='$user'" set PasswordExpires=false | Out-Null
+$admins = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+net localgroup $admins $user /add 2>&1 | Out-Null
 
 # OpenSSH Server
 if (Test-Path C:\lsw\OpenSSH-Win64.msi) {
@@ -584,7 +612,7 @@ cmd_install() {
 	local distro=${1:-}
 	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
 	shift
-	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc=''
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang=''
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
 		case $1 in
@@ -597,6 +625,7 @@ cmd_install() {
 		--iso) iso=$(realpath "$2"); shift ;;
 		--key) key=$2; shift ;;
 		--edition) edition=$2; shift ;;
+		--lang) lang=$2; shift ;;
 		--vnc) vnc=1 ;;
 		*) die "неизвестная опция: $1" ;;
 		esac
@@ -649,8 +678,7 @@ cmd_install() {
 		qemu-img resize -q "$DIR/disk.qcow2" "$disk"
 		make_seed
 	else
-		local lang
-		lang=$(win_lang "$iso")
+		[[ -n $lang ]] || lang=$(win_lang "$iso")
 		info "Windows ISO: язык $lang"
 		make_win_cfg "$iso" "$lang" "$key" "$edition"
 		qemu-img create -q -f qcow2 "$DIR/disk.qcow2" "$disk"

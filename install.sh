@@ -37,6 +37,8 @@ grep -qE 'vmx|svm' /proc/cpuinfo ||
 pkgs=(qemu-system-x86 qemu-utils ipxe-qemu seabios xorriso socat openssh-client curl iproute2)
 info "обновляю список пакетов"
 $SUDO apt-get update -qq
+# 7z — читать ISO Windows (UDF); в 22.04 пакет называется p7zip-full
+if apt-cache show 7zip >/dev/null 2>&1; then pkgs+=(7zip); else pkgs+=(p7zip-full); fi
 if apt-cache show virtiofsd >/dev/null 2>&1; then
 	pkgs+=(virtiofsd)
 else
