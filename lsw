@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.3.1
+LSW_VERSION=0.3.2
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
 die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
@@ -508,7 +508,13 @@ EOF
 
 windows_args() {
 	local net="user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
-	[[ -n $SHARE ]] && command -v smbd >/dev/null && net+=",smb=$SHARE" # \\10.0.2.4\qemu
+	if [[ -n $SHARE ]]; then # в Windows: \\10.0.2.4\qemu (QEMU сам запускает smbd от пользователя)
+		if command -v smbd >/dev/null || [[ -x /usr/sbin/smbd ]]; then
+			net+=",smb=$SHARE"
+		else
+			warn "общая папка для Windows требует samba на хосте: sudo apt install samba / sudo pacman -S samba"
+		fi
+	fi
 	ARGS+=(-cpu "${LSW_WIN_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic,hv_stimer}"
 		-rtc base=localtime
 		-drive "file=$DIR/disk.qcow2,if=none,id=d0,discard=unmap,detect-zeroes=unmap" -device ide-hd,drive=d0,bus=ide.0
