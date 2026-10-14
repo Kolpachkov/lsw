@@ -204,6 +204,8 @@ users:
 ssh_pwauth: false
 growpart: {mode: auto, devices: ['/']}
 EOF
+		# в cloud-образе Ubuntu пустые списки apt; на Arch не делаем -Sy (частичное обновление)
+		[[ $DISTRO == ubuntu* ]] && echo 'package_update: true'
 		if [[ -n $SHARE ]]; then
 			cat <<'EOF'
 runcmd:
