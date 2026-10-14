@@ -547,12 +547,25 @@ vm_stop() {
 	rm -f "$DIR/qemu.pid"
 }
 
+# VM, созданные без общей папки, не имеют записи в fstab — дописываем и монтируем
+ensure_mount() {
+	[[ $TYPE == linux && -n $SHARE ]] || return 0
+	ssh_opts
+	"${SSH[@]}" "$VMUSER@127.0.0.1" 'mountpoint -q /mnt/host && exit 0
+sudo mkdir -p /mnt/host
+grep -q " /mnt/host " /etc/fstab || echo "host /mnt/host virtiofs defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
+sudo mount /mnt/host' </dev/null >/dev/null 2>&1 ||
+		warn "общая папка не смонтировалась — перезапусти VM: lsw restart $NAME"
+}
+
 ensure_up() { # запустить при необходимости и дождаться ssh
 	[[ $INSTALLED == 1 ]] || die "'$NAME' ещё устанавливается (lsw list, lsw logs $NAME)"
 	if ! is_running; then vm_start; fi
-	ssh_ready && return
-	printf '\e[2m... жду %s\e[0m\n' "$NAME" >&2
-	wait_ssh 180 || die "ssh в '$NAME' не поднялся (lsw console $NAME)"
+	if ! ssh_ready; then
+		printf '\e[2m... жду %s\e[0m\n' "$NAME" >&2
+		wait_ssh 180 || die "ssh в '$NAME' не поднялся (lsw console $NAME)"
+	fi
+	ensure_mount
 }
 
 # ---------- команды ----------
@@ -807,6 +820,8 @@ cmd_share() { # [имя] [DIR[:ro]|off]
 		read -rp "Перезапустить $NAME сейчас, чтобы применить? [Y/n] " a
 		if [[ $a != [nNнН]* ]]; then
 			vm_stop && vm_start && { wait_ssh 180 || warn "ssh пока не отвечает"; }
+			ensure_mount
+			[[ -z $SHARE ]] || info "в госте: /mnt/host"
 			return 0
 		fi
 	fi
@@ -846,7 +861,7 @@ main() {
 			load_vm "${1:?имя}" && vm_stop
 		fi
 		;;
-	restart) load_vm "${1:?имя}" && vm_stop && vm_start && { [[ $INSTALLED != 1 ]] || wait_ssh 180 || warn "ssh пока не отвечает"; } ;;
+	restart) load_vm "${1:?имя}" && vm_stop && vm_start && { [[ $INSTALLED != 1 ]] || { wait_ssh 180 && ensure_mount; } || warn "ssh пока не отвечает"; } ;;
 	console) cmd_console "$@" ;;
 	logs) load_vm "$(resolve_name "${1:-}")" && tail -n "${2:-100}" -f "$DIR/console.log" ;;
 	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
