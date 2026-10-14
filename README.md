@@ -20,7 +20,6 @@ git clone https://github.com/Kolpachkov/lsw ~/lsw && ln -s ~/lsw/lsw ~/.local/bi
 ## Использование
 
 ```sh
-
 lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init, изолирована
 lsw install arch
 lsw install windows --iso ~/Downloads/Win10_22H2_Russian_x64.iso   # 15–40 мин без участия
@@ -45,6 +44,7 @@ lsw stop --all
 | Консоль | `lsw console` — ttyS0 | `lsw console` — SAC (EMS) на COM1 |
 
 Сеть — user-mode (slirp), root не нужен. Наружу торчит только `127.0.0.1:<порт>` → гость:22.
+
 ## Изоляция и общие папки
 
 По умолчанию VM **изолирована**: файлов хоста она не видит. Папку открывают явно:
