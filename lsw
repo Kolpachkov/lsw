@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.3.2
+LSW_VERSION=0.4.0
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
 die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
@@ -17,7 +17,7 @@ usage() {
 	cat <<'EOF'
 lsw — лёгкие терминальные виртуалки (Linux / Windows 10) на QEMU/KVM
 
-  lsw install <ubuntu|ubuntu-24.04|arch> [имя] [опции]
+  lsw install <ubuntu|ubuntu-24.04|ubuntu-22.04|arch> [имя] [опции]
   lsw install ubuntu  [имя] --iso ubuntu-XX.04-live-server-amd64.iso  (автоустановка с ISO)
   lsw install windows [имя] --iso Win10.iso [опции]
       --cpus N        (linux 2, windows 4)
@@ -52,10 +52,10 @@ EOF
 # ---------- зависимости ----------
 
 find_virtiofsd() {
-	command -v virtiofsd 2>/dev/null && return
+	# нужен Rust-virtiofsd (--shared-dir); старый C-вариант из qemu 6.x (Ubuntu 22.04) не подходит
 	local p
-	for p in /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
-		[[ -x $p ]] && { echo "$p"; return; }
+	for p in "$(command -v virtiofsd 2>/dev/null)" /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
+		[[ -n $p && -x $p ]] && "$p" --help 2>&1 | grep -q -- --shared-dir && { echo "$p"; return; }
 	done
 	return 1
 }
@@ -165,6 +165,7 @@ distro_url() {
 	case $1 in
 	ubuntu | ubuntu-26.04) echo https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img ;;
 	ubuntu-24.04) echo https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img ;;
+	ubuntu-22.04) echo https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img ;;
 	arch) echo https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2 ;;
 	*) return 1 ;;
 	esac
@@ -172,7 +173,7 @@ distro_url() {
 
 pull_image() { # distro [force]
 	local url f
-	url=$(distro_url "$1") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, arch, windows)"
+	url=$(distro_url "$1") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, ubuntu-22.04, arch, windows)"
 	f=$CACHE/$1.img
 	if [[ ! -f $f || ${2:-} == force ]]; then
 		mkdir -p "$CACHE"

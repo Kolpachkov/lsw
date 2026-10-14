@@ -11,6 +11,15 @@ gh release download -R Kolpachkov/lsw -p 'lsw-ubuntu.tar.gz'
 tar xzf lsw-ubuntu.tar.gz && cd lsw && ./install.sh   # потом перелогиниться
 ```
 
+**Ubuntu без интернета** — в релизе есть наборы со всеми пакетами (24.04 и 26.04).
+Скачай на любой машине `lsw-offline-ubuntu-<версия>.tar.gz` под свою версию (`lsb_release -rs`), перенеси и:
+```sh
+tar xzf lsw-offline-ubuntu-24.04.tar.gz && cd lsw && ./install.sh   # пакеты ставятся из набора сами
+```
+Ставится только недостающее, уже установленные пакеты не трогаются. Образы VM в набор не входят:
+для `lsw install ubuntu|arch` нужен интернет (или ISO: `lsw install ubuntu --iso …`).
+Пересобрать наборы: `tools/build-offline.sh`.
+
 **Arch:**
 ```sh
 sudo pacman -S --needed qemu-base libisoburn socat 7zip
