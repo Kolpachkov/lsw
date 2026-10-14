@@ -38,7 +38,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
   lsw console <имя>         серийная консоль (выход: Ctrl+])
   lsw logs <имя>            лог консоли
   lsw default <имя>         VM по умолчанию
-  lsw share <имя> [DIR[:ro]|off]  показать / сменить общую папку (после — lsw restart)
+  lsw share [имя] [DIR[:ro]|off]  показать / сменить общую папку (без имени — VM по умолчанию)
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
   lsw pull <дистрибутив>    перекачать базовый образ
@@ -775,9 +775,16 @@ parse_share() { # DIR[:ro] -> PSHARE, PSHARE_RO
 	[[ $PSHARE != / ]] || die "открывать гостю весь / — плохая идея"
 }
 
-cmd_share() {
-	load_vm "${1:?имя}"
-	local spec=${2:-}
+cmd_share() { # [имя] [DIR[:ro]|off]
+	local name=${1:-} spec=${2:-}
+	# lsw share ~/dir — без имени берём VM по умолчанию
+	if [[ $# == 1 && ! -f $(vm_dir "$name")/vm.conf ]] &&
+		[[ $name == off || $name == */* || $name == . || $name == .. || -d ${name%:ro} ]]; then
+		spec=$name name=''
+	elif [[ $# == 1 && ! -f $(vm_dir "$name")/vm.conf ]]; then
+		die "'$name' — нет ни такой VM, ни такой папки"
+	fi
+	load_vm "$(resolve_name "$name")"
 	if [[ -z $spec ]]; then
 		if [[ -z $SHARE ]]; then echo "$NAME: изолирована, общих папок нет"
 		else echo "$NAME: $SHARE -> /mnt/host ($([[ ${SHARE_RO:-0} == 1 ]] && echo 'только чтение' || echo 'чтение и запись'))"; fi
@@ -794,7 +801,16 @@ cmd_share() {
 		conf_set SHARE_RO "$PSHARE_RO"
 		info "$NAME: $PSHARE -> /mnt/host$([[ $PSHARE_RO == 1 ]] && echo ' (только чтение)')"
 	fi
-	is_running && warn "применится после перезапуска: lsw restart $NAME" || true
+	is_running || return 0
+	if [[ -t 0 ]]; then
+		local a
+		read -rp "Перезапустить $NAME сейчас, чтобы применить? [Y/n] " a
+		if [[ $a != [nNнН]* ]]; then
+			vm_stop && vm_start && { wait_ssh 180 || warn "ssh пока не отвечает"; }
+			return 0
+		fi
+	fi
+	warn "применится после перезапуска: lsw restart $NAME"
 }
 
 cmd_rm() {
