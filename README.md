@@ -3,9 +3,23 @@
 Аналог WSL для Linux: лёгкие headless-виртуалки на QEMU/KVM, управляемые одной bash-утилитой.
 Гости: **Ubuntu** (26.04 / 24.04), **Arch**, **Windows 10**. Без GUI, вход через терминал (ssh).
 
+## Установка
+
+**Ubuntu 24.04+ / Debian 12+:**
+```sh
+gh release download -R Kolpachkov/lsw -p 'lsw-ubuntu.tar.gz'
+tar xzf lsw-ubuntu.tar.gz && cd lsw && ./install.sh   # потом перелогиниться
+```
+
+**Arch:**
 ```sh
 sudo pacman -S --needed qemu-base libisoburn socat
-ln -s ~/Work/lsw/lsw ~/.local/bin/lsw
+git clone https://github.com/Kolpachkov/lsw ~/lsw && ln -s ~/lsw/lsw ~/.local/bin/lsw
+```
+
+## Использование
+
+```sh
 
 lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init
 lsw install arch
