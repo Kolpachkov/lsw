@@ -21,7 +21,7 @@ git clone https://github.com/Kolpachkov/lsw ~/lsw && ln -s ~/lsw/lsw ~/.local/bi
 
 ```sh
 
-lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init
+lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init, изолирована
 lsw install arch
 lsw install windows --iso ~/Downloads/Win10_22H2_Russian_x64.iso   # 15–40 мин без участия
 
@@ -40,12 +40,26 @@ lsw stop --all
 | Установка | официальный cloud-образ → копия qcow2 → cloud-init (пользователь, ключ, hostname) | ISO + собственный `autounattend.xml` на втором CD, BIOS, разметка MBR |
 | Вход | ssh, ключ `~/.local/share/lsw/id_ed25519` | Win32-OpenSSH, по умолчанию PowerShell |
 | Диск / сеть | virtio-blk, virtio-net | AHCI, e1000e (драйверы встроены, virtio-win не нужен) |
-| Общая папка | `$HOME` → `/mnt/host` через virtiofs | `\\10.0.2.4\qemu`, если на хосте стоит `samba` |
+| Общая папка | по умолчанию нет; `--share DIR[:ro]` → `/mnt/host` через virtiofs | `\\10.0.2.4\qemu`, если на хосте стоит `samba` |
 | Память | balloon с free-page-reporting: свободная память гостя возвращается хосту | — |
 | Консоль | `lsw console` — ttyS0 | `lsw console` — SAC (EMS) на COM1 |
 
 Сеть — user-mode (slirp), root не нужен. Наружу торчит только `127.0.0.1:<порт>` → гость:22.
-Как и в WSL, `lsw shell` открывается в той же папке, если ты стоишь внутри общей.
+## Изоляция и общие папки
+
+По умолчанию VM **изолирована**: файлов хоста она не видит. Папку открывают явно:
+
+```sh
+lsw install ubuntu dev --share ~/Work        # чтение и запись
+lsw share dev ~/Work/project:ro              # сменить: только чтение (запрет на стороне хоста, root гостя не обойдёт)
+lsw share dev off                            # снова изолировать
+lsw restart dev                              # изменения применяются после перезапуска
+```
+
+Если ты стоишь внутри общей папки, `lsw shell` откроется в той же папке гостя, как в WSL.
+
+Сеть: гость выходит в интернет через user-mode NAT, а **сервисы хоста на `localhost` доступны ему по `10.0.2.2`**.
+Не держи на `127.0.0.1` хоста ничего без пароля, если запускаешь в VM недоверенный код.
 
 Файлы: `~/.local/share/lsw/vms/<имя>/` (диск, `vm.conf`, логи, сокеты QMP и консоли),
 базовые образы кешируются в `~/.local/share/lsw/cache/`.

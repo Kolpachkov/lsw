@@ -21,7 +21,8 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --cpus N        (linux 2, windows 4)
       --mem  4G       (linux 2G, windows 4G)
       --disk 40G      (linux 20G, windows 64G)
-      --share DIR     папка хоста в госте (по умолчанию $HOME); --no-share — без неё
+      --share DIR[:ro]  открыть папку хоста в госте как /mnt/host (:ro — только чтение);
+                        по умолчанию VM изолирована и ничего с хоста не видит
       --password P    пароль пользователя (по умолчанию = имя пользователя)
       --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
       --edition N     индекс редакции в install.wim/esd
@@ -36,6 +37,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
   lsw console <имя>         серийная консоль (выход: Ctrl+])
   lsw logs <имя>            лог консоли
   lsw default <имя>         VM по умолчанию
+  lsw share <имя> [DIR[:ro]|off]  показать / сменить общую папку (после — lsw restart)
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
   lsw pull <дистрибутив>    перекачать базовый образ
@@ -206,27 +208,30 @@ growpart: {mode: auto, devices: ['/']}
 EOF
 		# в cloud-образе Ubuntu пустые списки apt; на Arch не делаем -Sy (частичное обновление)
 		[[ $DISTRO == ubuntu* ]] && echo 'package_update: true'
-		if [[ -n $SHARE ]]; then
-			cat <<'EOF'
+		# запись в fstab есть всегда (nofail): папку можно включить позже через lsw share
+		cat <<'EOF'
 runcmd:
   - mkdir -p /mnt/host
   - grep -q ' /mnt/host ' /etc/fstab || echo 'host /mnt/host virtiofs defaults,nofail 0 0' >> /etc/fstab
   - mount /mnt/host || true
 EOF
-		fi
 	} >"$d/user-data"
 	mkiso "$d" "$DIR/seed.iso" cidata
 }
 
 start_virtiofsd() {
-	local bin lim
-	bin=$(find_virtiofsd) || die "virtiofsd не найден (или используй --no-share)"
-	[[ -d $SHARE ]] || die "папка для общего доступа не существует: $SHARE"
+	local bin lim ro=()
+	bin=$(find_virtiofsd) || die "virtiofsd не найден (выключи общую папку: lsw share $NAME off)"
+	[[ -d $SHARE ]] || die "папка для общего доступа не существует: $SHARE (lsw share $NAME off)"
+	if [[ ${SHARE_RO:-0} == 1 ]]; then
+		"$bin" --help 2>&1 | grep -q -- --readonly || die "этот virtiofsd не умеет --readonly (нужен 1.11+)"
+		ro=(--readonly)
+	fi
 	rm -f "$DIR/vfs.sock"
 	lim=$(ulimit -Hn)
 	[[ $lim =~ ^[0-9]+$ ]] || lim=1048576
 	setsid "$bin" --socket-path="$DIR/vfs.sock" --shared-dir="$SHARE" \
-		--sandbox=none --cache=auto --rlimit-nofile="$lim" \
+		--sandbox=none --cache=auto --rlimit-nofile="$lim" "${ro[@]}" \
 		>"$DIR/virtiofsd.log" 2>&1 </dev/null &
 	echo $! >"$DIR/virtiofsd.pid"
 	local i
@@ -493,14 +498,14 @@ cmd_install() {
 	local distro=${1:-}
 	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
 	shift
-	local name='' cpus='' mem='' disk='' share=$HOME pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc=''
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc=''
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
 		case $1 in
 		--cpus) cpus=$2; shift ;;
 		--mem) mem=$2; shift ;;
 		--disk) disk=$2; shift ;;
-		--share) share=$(realpath "$2"); shift ;;
+		--share) parse_share "$2"; share=$PSHARE share_ro=$PSHARE_RO; shift ;;
 		--no-share) share='' ;;
 		--password) pass=$2; shift ;;
 		--iso) iso=$(realpath "$2"); shift ;;
@@ -535,7 +540,7 @@ cmd_install() {
 	mkdir -p "$DIR"
 	trap '[[ -f $DIR/vm.conf ]] || rm -rf "$DIR"' EXIT
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
-	TYPE=$type DISTRO=$distro CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share ISO=$iso INSTALLED=0
+	TYPE=$type DISTRO=$distro CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
 
 	if [[ $type == linux ]]; then
 		local base
@@ -554,7 +559,7 @@ cmd_install() {
 
 	local v
 	{
-		for v in TYPE DISTRO CPUS MEM PORT VMUSER SHARE ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
+		for v in TYPE DISTRO CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
 	trap - EXIT
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
@@ -657,6 +662,37 @@ cmd_ssh_config() {
 	done
 }
 
+parse_share() { # DIR[:ro] -> PSHARE, PSHARE_RO
+	local spec=$1
+	PSHARE_RO=0
+	if [[ $spec == *:ro ]]; then spec=${spec%:ro}; PSHARE_RO=1; fi
+	[[ -d $spec ]] || die "нет такой папки: $spec"
+	PSHARE=$(realpath "$spec")
+	[[ $PSHARE != / ]] || die "открывать гостю весь / — плохая идея"
+}
+
+cmd_share() {
+	load_vm "${1:?имя}"
+	local spec=${2:-}
+	if [[ -z $spec ]]; then
+		if [[ -z $SHARE ]]; then echo "$NAME: изолирована, общих папок нет"
+		else echo "$NAME: $SHARE -> /mnt/host ($([[ ${SHARE_RO:-0} == 1 ]] && echo 'только чтение' || echo 'чтение и запись'))"; fi
+		return
+	fi
+	[[ $TYPE == linux ]] || warn "для Windows папка работает только через samba (\\\\10.0.2.4\\qemu), только чтение не поддерживается"
+	if [[ $spec == off ]]; then
+		conf_set SHARE ''
+		conf_set SHARE_RO 0
+		info "$NAME: общая папка выключена"
+	else
+		parse_share "$spec"
+		conf_set SHARE "$PSHARE"
+		conf_set SHARE_RO "$PSHARE_RO"
+		info "$NAME: $PSHARE -> /mnt/host$([[ $PSHARE_RO == 1 ]] && echo ' (только чтение)')"
+	fi
+	is_running && warn "применится после перезапуска: lsw restart $NAME" || true
+}
+
 cmd_rm() {
 	local n=${1:-} force=${2:-}
 	[[ -n $n ]] || die "lsw rm <имя>"
@@ -690,11 +726,12 @@ main() {
 			load_vm "${1:?имя}" && vm_stop
 		fi
 		;;
-	restart) load_vm "${1:?имя}" && vm_stop && vm_start ;;
+	restart) load_vm "${1:?имя}" && vm_stop && vm_start && { [[ $INSTALLED != 1 ]] || wait_ssh 180 || warn "ssh пока не отвечает"; } ;;
 	console) cmd_console "$@" ;;
 	logs) load_vm "$(resolve_name "${1:-}")" && tail -n "${2:-100}" -f "$DIR/console.log" ;;
 	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
 	ssh-config) cmd_ssh_config "$@" ;;
+	share) cmd_share "$@" ;;
 	rm | remove) cmd_rm "$@" ;;
 	pull) pull_image "${1:?дистрибутив}" force >/dev/null ;;
 	deps) cmd_deps ;;
