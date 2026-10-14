@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.3.0
+LSW_VERSION=0.3.1
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
 die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
@@ -32,8 +32,8 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --vnc           включить VNC 127.0.0.1:59xx (посмотреть, что с установкой Windows)
 
   lsw                       shell в VM по умолчанию
-  lsw shell [имя]           терминал гостя (VM запустится сама)
-  lsw run <имя> -- cmd...   выполнить команду в госте
+  lsw shell [имя]           терминал гостя (VM запустится сама); то же: lsw <имя>
+  lsw run <имя> [-- cmd...] выполнить команду в госте (без команды — терминал)
   lsw list                  список VM
   lsw start|stop|restart <имя>
   lsw stop --all
@@ -789,7 +789,7 @@ cmd_run() {
 	[[ -n $n ]] || die "lsw run <имя> -- команда"
 	shift
 	[[ ${1:-} == -- ]] && shift
-	(($#)) || die "не указана команда"
+	(($#)) || cmd_shell "$n" # без команды — просто терминал
 	load_vm "$n"
 	ensure_up
 	ssh_opts
@@ -916,7 +916,11 @@ main() {
 	deps) cmd_deps ;;
 	version | --version | -V) echo "lsw $LSW_VERSION ($(readlink -f "$0"))" ;;
 	-h | --help | help) usage ;;
-	*) die "неизвестная команда: $c (lsw help)" ;;
+	*)
+		# lsw <имя VM> — терминал этой VM
+		[[ -f $(vm_dir "$c")/vm.conf ]] && cmd_shell "$c"
+		die "неизвестная команда: $c (lsw help)"
+		;;
 	esac
 }
 
