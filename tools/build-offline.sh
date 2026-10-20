@@ -18,6 +18,7 @@ cd /mnt/host
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dpkg-dev >/dev/null
 pkgs="qemu-system-x86 qemu-utils ipxe-qemu seabios xorriso socat openssh-client curl iproute2 samba"
+pkgs+=" qemu-system-arm qemu-efi-aarch64" # для ./install.sh --arm64
 if apt-cache show 7zip >/dev/null 2>&1; then pkgs+=" 7zip"; else pkgs+=" p7zip-full"; fi
 if apt-cache show virtiofsd >/dev/null 2>&1; then pkgs+=" virtiofsd"; fi
 apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks \
@@ -27,7 +28,7 @@ dpkg-scanpackages -m . /dev/null 2>/dev/null | gzip -9 >Packages.gz
 echo "$(ls *.deb | wc -l) пакетов, $(du -sh . | cut -f1)"'
 
 ARCH_BUILDER='set -euo pipefail
-pkgs="qemu-base libisoburn socat 7zip openssh curl iproute2 samba"
+pkgs="qemu-base libisoburn socat 7zip openssh curl iproute2 samba qemu-system-aarch64 edk2-aarch64"
 sudo pacman -Sy --noconfirm --needed archlinux-keyring >/dev/null
 # пустая база: качаем полное дерево зависимостей, а не только недостающее в этой VM
 sudo rm -rf /var/tmp/db /var/tmp/pkgs && sudo mkdir -p /var/tmp/db /var/tmp/pkgs

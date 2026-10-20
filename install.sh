@@ -3,6 +3,7 @@
 #   ./install.sh               — поставить зависимости и lsw в ~/.local/bin; если рядом есть
 #                                офлайн-набор (offline/ubuntu-XX.04/), пакеты ставятся из него без интернета
 #   ./install.sh --online      — игнорировать офлайн-набор, ставить из интернета
+#   ./install.sh --arm64       — ещё и эмулятор ARM для arm64-гостей (lsw install ubuntu --arch arm64)
 #   ./install.sh --uninstall   — удалить lsw (VM в ~/.local/share/lsw не трогает)
 #   PREFIX=/usr/local sudo -E ./install.sh — установить для всех
 set -euo pipefail
@@ -17,19 +18,21 @@ die()  { printf '\e[1;31m!!\e[0m %s\n' "$*" >&2; exit 1; }
 SUDO=sudo
 [[ $EUID == 0 ]] && SUDO=
 
-OFFLINE=''
-case ${1:-} in
---uninstall)
-	rm -f "$PREFIX/bin/lsw"
-	rm -rf "$PREFIX/share/doc/lsw"
-	info "lsw удалён. Виртуалки и образы остались в ~/.local/share/lsw (rm -rf, если не нужны)"
-	exit 0
-	;;
---online) OFFLINE=no ;;
---offline) OFFLINE=1 ;;
-'') ;;
-*) die "неизвестный параметр: $1 (--online, --uninstall)" ;;
-esac
+OFFLINE='' ARM=''
+for a in "$@"; do
+	case $a in
+	--uninstall)
+		rm -f "$PREFIX/bin/lsw"
+		rm -rf "$PREFIX/share/doc/lsw"
+		info "lsw удалён. Виртуалки и образы остались в ~/.local/share/lsw (rm -rf, если не нужны)"
+		exit 0
+		;;
+	--online) OFFLINE=no ;;
+	--offline) OFFLINE=1 ;;
+	--arm64) ARM=1 ;;
+	*) die "неизвестный параметр: $a (--online, --arm64, --uninstall)" ;;
+	esac
+done
 # офлайн-набор подхватывается сам, если он есть для этой системы
 . /etc/os-release
 if [[ -z $OFFLINE ]] && { [[ -f $SRC/offline/ubuntu-${VERSION_ID:-}/Packages.gz ]] || [[ -f $SRC/offline/arch/lsw-offline.db ]]; }; then
@@ -64,6 +67,7 @@ apt_install() {
 		info "офлайн-репозиторий: $repo"
 	fi
 	$SUDO apt-get "${opts[@]}" update -qq
+	[[ -z $ARM ]] || pkgs+=(qemu-system-arm qemu-efi-aarch64)
 	if apt-cache "${opts[@]}" show 7zip >/dev/null 2>&1; then pkgs+=(7zip); else pkgs+=(p7zip-full); fi
 	if apt-cache "${opts[@]}" show virtiofsd >/dev/null 2>&1; then
 		pkgs+=(virtiofsd)
@@ -81,6 +85,7 @@ apt_install() {
 
 pacman_install() {
 	local pkgs=(qemu-base libisoburn socat 7zip openssh curl iproute2 samba)
+	[[ -z $ARM ]] || pkgs+=(qemu-system-aarch64 edk2-aarch64)
 	if [[ -n $OFFLINE ]]; then
 		local repo=$SRC/offline/arch conf
 		[[ -f $repo/lsw-offline.db ]] || die "в наборе нет пакетов для Arch (ждал $repo)"
@@ -152,5 +157,6 @@ cat <<EOF
   lsw install ubuntu
   lsw install arch
   lsw install windows --iso ~/Downloads/Win10.iso
+  lsw install ubuntu armbox --arch arm64   # нужен ./install.sh --arm64
   lsw
 EOF

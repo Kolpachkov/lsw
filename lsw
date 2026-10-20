@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# lsw — WSL-подобные headless-VM для Linux на QEMU/KVM (гости: Ubuntu, Arch, Windows 10)
+# lsw — WSL-подобные headless-VM для Linux на QEMU/KVM (гости: Ubuntu, Arch, Windows 10; Ubuntu arm64 — эмуляция)
 set -euo pipefail
 
 LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.4.0
+LSW_VERSION=0.5.0
+LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
 die()  { printf '\e[1;31mlsw:\e[0m %s\n' "$*" >&2; exit 1; }
@@ -23,6 +24,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --cpus N        (linux 2, windows 4)
       --mem  4G       (linux 2G, windows 4G)
       --disk 40G      (linux 20G, windows 64G)
+      --arch arm64    ARM-гость (только ubuntu*, без KVM — программная эмуляция, в разы медленнее)
       --share DIR[:ro]  открыть папку хоста в госте как /mnt/host (:ro — только чтение);
                         по умолчанию VM изолирована и ничего с хоста не видит
       --password P    пароль пользователя (по умолчанию = имя пользователя)
@@ -46,6 +48,8 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
   lsw pull <дистрибутив>    перекачать базовый образ
   lsw deps                  проверить зависимости
   lsw version               версия и путь к скрипту
+  lsw upgrade [--check]     обновить lsw (git pull или последний релиз); VM не трогаются
+  lsw upgrade --from F.tar.gz  обновить из скачанного архива (без интернета)
 EOF
 }
 
@@ -80,9 +84,22 @@ cmd_deps() {
 		return 1
 	fi
 	[[ ${1:-} == quiet ]] && return
+	find_aarch64 >/dev/null || warn "для arm64-гостей нужны qemu-system-aarch64 и UEFI: sudo pacman -S qemu-system-aarch64 edk2-aarch64 / sudo apt install qemu-system-arm qemu-efi-aarch64"
 	find_7z >/dev/null || warn "для Windows желателен 7z (читает ISO Microsoft): sudo pacman -S 7zip / sudo apt install 7zip"
 	info "все зависимости на месте"
 }
+
+# UEFI-прошивка для arm64 (virt): Arch/Fedora edk2-aarch64, Debian/Ubuntu qemu-efi-aarch64
+find_aavmf() {
+	local f
+	for f in /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+		/usr/share/edk2-armvirt/aarch64/QEMU_EFI.fd /usr/share/AAVMF/AAVMF_CODE.fd; do
+		[[ -f $f ]] && { echo "$f"; return; }
+	done
+	return 1
+}
+
+find_aarch64() { command -v qemu-system-aarch64 >/dev/null && find_aavmf; }
 
 ensure_key() {
 	[[ -f $KEY ]] || ssh-keygen -q -t ed25519 -N '' -C lsw -f "$KEY"
@@ -96,6 +113,7 @@ load_vm() {
 	NAME=$1
 	DIR=$(vm_dir "$NAME")
 	[[ -f $DIR/vm.conf ]] || die "VM '$NAME' не найдена (lsw list)"
+	ARCH=amd64 # VM до 0.5.0 — без ARCH в vm.conf
 	# shellcheck disable=SC1091
 	source "$DIR/vm.conf"
 }
@@ -142,7 +160,16 @@ free_port() {
 ssh_opts() {
 	SSH=(ssh -i "$KEY" -p "$PORT"
 		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-		-o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30)
+		-o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30
+		# одно соединение на VM: повторные run/shell не делают новый ssh-handshake
+		-o ControlMaster=auto -o ControlPath="$DIR/ssh.sock" -o ControlPersist=10m)
+}
+
+ssh_close() { # закрыть фоновое мастер-соединение (перед остановкой/перезапуском VM)
+	[[ -S $DIR/ssh.sock ]] || return 0
+	ssh_opts
+	"${SSH[@]}" -O exit "$VMUSER@127.0.0.1" >/dev/null 2>&1 || true
+	rm -f "$DIR/ssh.sock"
 }
 
 ssh_ready() {
@@ -151,7 +178,9 @@ ssh_ready() {
 }
 
 wait_ssh() { # таймаут в секундах
-	local deadline=$((SECONDS + ${1:-180}))
+	local t=${1:-180}
+	[[ ${ARCH:-amd64} == arm64 ]] && t=$((t * 4)) # эмуляция: загрузка в разы дольше
+	local deadline=$((SECONDS + t))
 	until ssh_ready; do
 		is_running || die "VM '$NAME' остановилась (lsw logs $NAME)"
 		((SECONDS < deadline)) || return 1
@@ -161,20 +190,22 @@ wait_ssh() { # таймаут в секундах
 
 # ---------- образы ----------
 
-distro_url() {
+distro_url() { # distro [amd64|arm64]
+	local a=${2:-amd64}
 	case $1 in
-	ubuntu | ubuntu-26.04) echo https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img ;;
-	ubuntu-24.04) echo https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img ;;
-	ubuntu-22.04) echo https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img ;;
-	arch) echo https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2 ;;
+	ubuntu | ubuntu-26.04) echo "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-$a.img" ;;
+	ubuntu-24.04) echo "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-$a.img" ;;
+	ubuntu-22.04) echo "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-$a.img" ;;
+	arch) [[ $a == amd64 ]] || return 1; echo https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2 ;;
 	*) return 1 ;;
 	esac
 }
 
-pull_image() { # distro [force]
-	local url f
-	url=$(distro_url "$1") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, ubuntu-22.04, arch, windows)"
+pull_image() { # distro [force] [arch]
+	local url f a=${3:-amd64}
+	url=$(distro_url "$1" "$a") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, ubuntu-22.04, arch, windows)"
 	f=$CACHE/$1.img
+	[[ $a == amd64 ]] || f=$CACHE/$1-$a.img
 	if [[ ! -f $f || ${2:-} == force ]]; then
 		mkdir -p "$CACHE"
 		info "скачиваю $1: $url"
@@ -297,9 +328,26 @@ start_virtiofsd() {
 	die "virtiofsd не запустился: $(tail -3 "$DIR/virtiofsd.log")"
 }
 
+# Кэш диска: writeback + io_uring (где io_uring выключен sysctl — потоки). cache=none (O_DIRECT)
+# не берём: на btrfs со сжатием/CoW он в разы медленнее на последовательном вводе-выводе.
+# Переопределить: LSW_DISK_CACHE="cache=none,aio=native" (ext4/xfs, btrfs с chattr +C)
+disk_cache() {
+	if [[ -n ${LSW_DISK_CACHE:-} ]]; then echo "$LSW_DISK_CACHE"; return; fi
+	if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 0 ]]; then
+		echo "cache=writeback,aio=io_uring"
+	else
+		echo "cache=writeback,aio=threads"
+	fi
+}
+
 linux_args() {
-	ARGS+=(-cpu host
-		-drive "file=$DIR/disk.qcow2,if=virtio,discard=unmap,detect-zeroes=unmap"
+	# arm64 (TCG): pauth-impdef — быстрая эмуляция pointer authentication
+	[[ $ARCH == arm64 ]] && ARGS+=(-cpu "${LSW_ARM_CPU:-max,pauth-impdef=on}") || ARGS+=(-cpu host)
+	ARGS+=(
+		# отдельный iothread: ввод-вывод диска не стоит в очереди за vCPU и эмуляцией устройств
+		-object iothread,id=io0
+		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap"
+		-device virtio-blk-pci,drive=d0,iothread=io0,bootindex=0
 		-drive "file=$DIR/seed.iso,if=virtio,format=raw,readonly=on"
 		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
 		-device virtio-net-pci,netdev=n0
@@ -518,7 +566,7 @@ windows_args() {
 	fi
 	ARGS+=(-cpu "${LSW_WIN_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic,hv_stimer}"
 		-rtc base=localtime
-		-drive "file=$DIR/disk.qcow2,if=none,id=d0,discard=unmap,detect-zeroes=unmap" -device ide-hd,drive=d0,bus=ide.0
+		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap" -device ide-hd,drive=d0,bus=ide.0
 		-netdev "$net" -device e1000e,netdev=n0
 		-vga std)
 	if [[ $INSTALLED != 1 ]]; then
@@ -532,11 +580,19 @@ windows_args() {
 
 vm_start() {
 	is_running && return
-	[[ -w /dev/kvm ]] || die "нет доступа к /dev/kvm"
-	rm -f "$DIR"/{qmp,console}.sock
+	rm -f "$DIR"/{qmp,console,ssh}.sock "$DIR/mounted"
 	local mem=$MEM
 	if [[ $TYPE == linux && -n ${ISO:-} && $INSTALLED != 1 ]] && (($(mem_mb "$MEM") < 4096)); then mem=4G; fi
-	ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm -smp "$CPUS" -m "$mem"
+	if [[ $ARCH == arm64 ]]; then # KVM для ARM на x86 нет — программная эмуляция (многопоточный TCG)
+		local fw
+		command -v qemu-system-aarch64 >/dev/null || die "нет qemu-system-aarch64: sudo pacman -S qemu-system-aarch64 / sudo apt install qemu-system-arm"
+		fw=$(find_aavmf) || die "нет UEFI для arm64: sudo pacman -S edk2-aarch64 / sudo apt install qemu-efi-aarch64"
+		ARGS=(qemu-system-aarch64 -name "$NAME" -machine virt -accel tcg,thread=multi,tb-size=512 -bios "$fw")
+	else
+		[[ -w /dev/kvm ]] || die "нет доступа к /dev/kvm"
+		ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm)
+	fi
+	ARGS+=(-smp "$CPUS" -m "$mem"
 		-chardev "socket,id=con,path=$DIR/console.sock,server=on,wait=off,logfile=$DIR/console.log,logappend=on"
 		-serial chardev:con
 		-qmp "unix:$DIR/qmp.sock,server=on,wait=off"
@@ -584,8 +640,9 @@ vm_stop() {
 		sleep 1
 		kill "$pid" 2>/dev/null || true
 	fi
+	ssh_close
 	stop_virtiofsd
-	rm -f "$DIR/qemu.pid"
+	rm -f "$DIR"/{qemu.pid,mounted}
 }
 
 # VM, созданные без общей папки, не имеют записи в fstab — дописываем и монтируем
@@ -605,7 +662,7 @@ for l in ~/* ~/.[!.]*; do
 	[ -L "$l" ] && [ "$(readlink "$l")" = /mnt/host ] && [ "$l" != ~/"$link" ] && rm -f "$l"
 done
 [ -e ~/"$link" ] || [ -L ~/"$link" ] || ln -s /mnt/host ~/"$link"
-exit 0' </dev/null >/dev/null 2>&1 ||
+exit 0' </dev/null >/dev/null 2>&1 && : >"$DIR/mounted" ||
 		warn "общая папка не смонтировалась — перезапусти VM: lsw restart $NAME"
 }
 
@@ -616,7 +673,8 @@ ensure_up() { # запустить при необходимости и дожд
 		printf '\e[2m... жду %s\e[0m\n' "$NAME" >&2
 		wait_ssh 180 || die "ssh в '$NAME' не поднялся (lsw console $NAME)"
 	fi
-	ensure_mount
+	# монтирование проверяем раз за загрузку, а не перед каждой командой
+	[[ -f $DIR/mounted ]] || ensure_mount
 }
 
 # ---------- команды ----------
@@ -625,7 +683,7 @@ cmd_install() {
 	local distro=${1:-}
 	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
 	shift
-	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang=''
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
 		case $1 in
@@ -639,6 +697,9 @@ cmd_install() {
 		--key) key=$2; shift ;;
 		--edition) edition=$2; shift ;;
 		--lang) lang=$2; shift ;;
+		--arch)
+			case $2 in amd64 | x86_64) arch=amd64 ;; arm64 | aarch64) arch=arm64 ;; *) die "--arch: amd64 или arm64" ;; esac
+			shift ;;
 		--vnc) vnc=1 ;;
 		*) die "неизвестная опция: $1" ;;
 		esac
@@ -646,6 +707,10 @@ cmd_install() {
 	done
 	cmd_deps quiet
 	ensure_key
+	if [[ $arch == arm64 ]]; then
+		[[ $distro == ubuntu* && -z $iso ]] || die "--arch arm64 поддерживается только для ubuntu из cloud-образа (без --iso)"
+		find_aarch64 >/dev/null || die "для arm64 нужны qemu-system-aarch64 и UEFI: sudo pacman -S qemu-system-aarch64 edk2-aarch64 / sudo apt install qemu-system-arm qemu-efi-aarch64"
+	fi
 
 	local type=linux
 	if [[ $distro == windows ]]; then
@@ -676,30 +741,30 @@ cmd_install() {
 	mkdir -p "$DIR"
 	trap '[[ -f $DIR/vm.conf ]] || rm -rf "$DIR"' EXIT
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
-	TYPE=$type DISTRO=$distro CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
+	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
 
 	if [[ $type == linux && -n $iso ]]; then
 		info "Ubuntu Server ISO ($distro), диск $disk"
 		extract_kernel "$iso"
-		qemu-img create -q -f qcow2 "$DIR/disk.qcow2" "$disk"
+		qemu-img create -q -f qcow2 -o preallocation=metadata "$DIR/disk.qcow2" "$disk"
 		make_autoinstall_seed
 	elif [[ $type == linux ]]; then
 		local base
-		base=$(pull_image "$distro")
+		base=$(pull_image "$distro" '' "$arch")
 		info "готовлю диск $disk"
-		qemu-img convert -O qcow2 -f "$(img_format "$base")" "$base" "$DIR/disk.qcow2"
-		qemu-img resize -q "$DIR/disk.qcow2" "$disk"
+		qemu-img convert -O qcow2 -o preallocation=metadata -f "$(img_format "$base")" "$base" "$DIR/disk.qcow2"
+		qemu-img resize -q --preallocation=metadata "$DIR/disk.qcow2" "$disk"
 		make_seed
 	else
 		[[ -n $lang ]] || lang=$(win_lang "$iso")
 		info "Windows ISO: язык $lang"
 		make_win_cfg "$iso" "$lang" "$key" "$edition"
-		qemu-img create -q -f qcow2 "$DIR/disk.qcow2" "$disk"
+		qemu-img create -q -f qcow2 -o preallocation=metadata "$DIR/disk.qcow2" "$disk"
 	fi
 
 	local v
 	{
-		for v in TYPE DISTRO CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
+		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
 	trap - EXIT
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
@@ -713,8 +778,8 @@ cmd_install() {
 			install_from_iso
 			vm_start
 		fi
-		info "первая загрузка и cloud-init..."
-		wait_ssh 300 || die "гость не поднял ssh за 5 минут (lsw logs $name)"
+		info "первая загрузка и cloud-init...$([[ $ARCH == arm64 ]] && echo ' (arm64 под эмуляцией: 5–15 минут)')"
+		wait_ssh 300 || die "гость не поднял ssh вовремя (lsw logs $name)"
 		ssh_opts
 		"${SSH[@]}" "$VMUSER@127.0.0.1" 'cloud-init status --wait >/dev/null 2>&1 || true'
 	else
@@ -769,7 +834,7 @@ cmd_list() {
 			if is_running; then
 				if [[ $INSTALLED == 1 ]]; then state=running; else state=installing; fi
 			else state=stopped; fi
-			printf '%-2s%-16s %-13s %-12s %-5s %-5s %s\n' "$([[ $n == "$def" ]] && echo '*')" "$n" "$DISTRO" "$state" "$CPUS" "$MEM" "$PORT"
+			printf '%-2s%-16s %-13s %-12s %-5s %-5s %s\n' "$([[ $n == "$def" ]] && echo '*')" "$n" "$DISTRO$([[ $ARCH == arm64 ]] && echo /arm64)" "$state" "$CPUS" "$MEM" "$PORT"
 		)
 	done
 }
@@ -802,8 +867,11 @@ cmd_run() {
 	ssh_opts
 	local tty=()
 	[[ -t 0 && -t 1 ]] && tty=(-t)
-	if [[ $TYPE == linux ]]; then
+	if [[ $TYPE == linux ]] && (($# > 1)); then
 		exec "${SSH[@]}" "${tty[@]}" "$VMUSER@127.0.0.1" "$(printf '%q ' "$@")"
+	elif [[ $TYPE == linux ]]; then
+		# один аргумент — строка для шелла гостя, как в ssh/WSL: lsw run vm -- 'a; b | c'
+		exec "${SSH[@]}" "${tty[@]}" "$VMUSER@127.0.0.1" "$1"
 	else
 		exec "${SSH[@]}" "${tty[@]}" "$VMUSER@127.0.0.1" "$*"
 	fi
@@ -893,6 +961,72 @@ cmd_rm() {
 	info "удалена: $n"
 }
 
+# ---------- обновление самого lsw ----------
+
+newer() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]; }
+
+cmd_upgrade() { # [--check] [--from lsw-*.tar.gz]
+	local self dir check='' from='' latest nv sudo=''
+	self=$(readlink -f "$0") dir=$(dirname "$self")
+	while (($#)); do
+		case $1 in
+		--check) check=1 ;;
+		--from) from=${2:?lsw upgrade --from <lsw-*.tar.gz>} && shift ;;
+		*) die "lsw upgrade [--check] [--from lsw-*.tar.gz]" ;;
+		esac
+		shift
+	done
+
+	# git-клон: обновляет git, VM и vm.conf не трогаются
+	if [[ -z $from ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		info "lsw из git-клона: $dir"
+		git -C "$dir" fetch -q || die "git fetch не удался"
+		latest=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null) || die "у ветки нет upstream (git -C $dir branch -u origin/main)"
+		((latest)) || { info "уже последняя: lsw $LSW_VERSION"; return; }
+		[[ -z $check ]] || { info "новых коммитов: $latest — обновить: lsw upgrade"; return; }
+		git -C "$dir" pull -q --ff-only || die "git pull --ff-only не прошёл: локальные изменения или ветка разошлась ($dir)"
+		"$self" version
+		"$self" deps quiet || true
+		return
+	fi
+
+	# установка из релиза: последний tar.gz с GitHub или указанный архив (офлайн-набор тоже подходит)
+	if [[ -z $from ]]; then
+		# gh — и для приватного репозитория; curl — без gh, если репозиторий публичный
+		latest=$(gh release view -R "$LSW_REPO" --json tagName -q .tagName 2>/dev/null) ||
+			latest=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/$LSW_REPO/releases/latest" 2>/dev/null) ||
+			latest=''
+		latest=${latest##*/}
+		latest=${latest#v}
+		[[ $latest =~ ^[0-9][0-9.]*$ ]] ||
+			die "не удалось узнать последнюю версию: нет интернета или доступа к $LSW_REPO (gh auth login). Без сети: lsw upgrade --from lsw-offline-….tar.gz"
+		newer "$latest" "$LSW_VERSION" || { info "уже последняя: lsw $LSW_VERSION"; return; }
+		[[ -z $check ]] || { info "доступна lsw $latest (установлена $LSW_VERSION) — обновить: lsw upgrade"; return; }
+	fi
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+	if [[ -z $from ]]; then
+		info "скачиваю lsw $latest"
+		gh release download "v$latest" -R "$LSW_REPO" -p lsw-ubuntu.tar.gz -O "$tmp/lsw.tar.gz" 2>/dev/null ||
+			curl -fL --progress-bar -o "$tmp/lsw.tar.gz" \
+				"https://github.com/$LSW_REPO/releases/download/v$latest/lsw-ubuntu.tar.gz" || die "не удалось скачать релиз"
+		from=$tmp/lsw.tar.gz
+	fi
+	[[ -f $from ]] || die "нет файла: $from"
+	tar -xzf "$from" -C "$tmp" lsw/lsw lsw/README.md 2>/dev/null || die "в $from нет lsw/lsw — это не архив lsw"
+	nv=$(sed -n 's/^LSW_VERSION=//p' "$tmp/lsw/lsw")
+	bash -n "$tmp/lsw/lsw" && [[ -n $nv ]] || die "lsw в архиве повреждён"
+	newer "$nv" "$LSW_VERSION" || { info "в архиве lsw $nv, установлена $LSW_VERSION — обновлять нечего"; return; }
+	[[ -z $check ]] || { info "в архиве lsw $nv (установлена $LSW_VERSION)"; return; }
+
+	[[ -w $dir ]] || sudo=sudo
+	# через новый файл + mv: запущенный сейчас lsw дочитывает свою старую копию
+	$sudo install -m755 "$tmp/lsw/lsw" "$self.new" && $sudo mv -f "$self.new" "$self" || die "не удалось записать $self"
+	[[ ! -f $dir/../share/doc/lsw/README.md ]] || $sudo install -m644 "$tmp/lsw/README.md" "$dir/../share/doc/lsw/README.md"
+	info "lsw $LSW_VERSION → $nv"
+	"$self" deps quiet || warn "новой версии нужны пакеты выше — или запусти install.sh из нового архива"
+}
+
 main() {
 	mkdir -p "$VMS"
 	local c=${1:-}
@@ -922,6 +1056,7 @@ main() {
 	pull) pull_image "${1:?дистрибутив}" force >/dev/null ;;
 	deps) cmd_deps ;;
 	version | --version | -V) echo "lsw $LSW_VERSION ($(readlink -f "$0"))" ;;
+	upgrade | update) cmd_upgrade "$@" ;;
 	-h | --help | help) usage ;;
 	*)
 		# lsw <имя VM> — терминал этой VM

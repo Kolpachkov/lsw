@@ -1,7 +1,7 @@
 # lsw
 
 Аналог WSL для Linux: лёгкие headless-виртуалки на QEMU/KVM, управляемые одной bash-утилитой.
-Гости: **Ubuntu** (26.04 / 24.04), **Arch**, **Windows 10**. Без GUI, вход через терминал (ssh).
+Гости: **Ubuntu** (26.04 / 24.04), **Arch**, **Windows 10**, а также **Ubuntu arm64** под эмуляцией. Без GUI, вход через терминал (ssh).
 
 ## Установка
 
@@ -26,6 +26,15 @@ sudo pacman -S --needed qemu-base libisoburn socat 7zip
 git clone https://github.com/Kolpachkov/lsw ~/lsw && ln -s ~/lsw/lsw ~/.local/bin/lsw
 ```
 
+**Обновление:**
+```sh
+lsw upgrade --check           # есть ли новая версия
+lsw upgrade                   # git-клон — git pull; установка из релиза — последний lsw-ubuntu.tar.gz
+lsw upgrade --from lsw-offline-ubuntu-24.04.tar.gz   # без интернета, из перенесённого архива
+```
+Виртуалки, диски и настройки (`~/.local/share/lsw`) не трогаются, запущенные VM продолжают работать.
+Если новой версии нужны новые пакеты, `lsw upgrade` скажет об этом; тогда запусти `./install.sh` из нового архива.
+
 ## Использование
 
 ```sh
@@ -40,6 +49,23 @@ lsw run windows -- Get-ComputerInfo
 lsw list
 lsw stop --all
 ```
+
+## ARM (arm64)
+
+```sh
+./install.sh --arm64                     # или: sudo pacman -S qemu-system-aarch64 edk2-aarch64
+                                         #      sudo apt install qemu-system-arm qemu-efi-aarch64
+lsw install ubuntu armbox --arch arm64   # также ubuntu-24.04 / ubuntu-22.04
+lsw run armbox -- uname -m                # aarch64
+```
+
+Настоящая ARM-машина (`virt`, UEFI, своё ядро и systemd) на официальном arm64 cloud-образе Ubuntu.
+KVM для ARM на x86 не бывает, поэтому это **программная эмуляция** (многопоточный TCG):
+в 5–10 раз медленнее нативной VM, первая загрузка с cloud-init — 5–15 минут. Для терминала, сборки
+и тестов под arm64 хватает; общие папки (`--share`) работают так же, через virtiofs.
+Только Ubuntu: у Arch Linux ARM нет cloud-образа, Windows on ARM не поддерживается.
+Если нужно лишь запускать arm64-бинарники или собирать образы, легче `qemu-user-static` + binfmt
+(`docker run --platform linux/arm64 …`).
 
 ## Как устроено
 
