@@ -777,6 +777,15 @@ windows_args() {
 
 # ---------- запуск / остановка ----------
 
+kvm_check() { # /dev/kvm доступен? иначе — понятная причина
+	[[ -w /dev/kvm ]] && return
+	[[ -e /dev/kvm ]] || die "нет /dev/kvm: включи виртуализацию (VT-x/AMD-V) в BIOS; в облачной VM нужна nested virtualization"
+	if id -nG "$USER" 2>/dev/null | grep -qw kvm || getent group kvm | grep -qE "[:,]$USER(,|$)"; then
+		die "нет доступа к /dev/kvm: группа kvm добавлена, но сессия старая — перелогинься (или выполни: newgrp kvm)"
+	fi
+	die "нет доступа к /dev/kvm: sudo usermod -aG kvm $USER, затем перелогинься"
+}
+
 vm_start() {
 	is_running && return
 	rm -f "$DIR"/{qmp,console,ssh}.sock "$DIR/mounted"
@@ -788,7 +797,7 @@ vm_start() {
 		fw=$(find_aavmf) || die "нет UEFI для arm64: sudo pacman -S edk2-aarch64 / sudo apt install qemu-efi-aarch64"
 		ARGS=(qemu-system-aarch64 -name "$NAME" -machine virt -accel tcg,thread=multi,tb-size=512 -bios "$fw")
 	else
-		[[ -w /dev/kvm ]] || die "нет доступа к /dev/kvm"
+		kvm_check
 		ARGS=(qemu-system-x86_64 -name "$NAME" -machine q35,accel=kvm)
 	fi
 	ARGS+=(-smp "$CPUS" -m "$mem"
@@ -928,6 +937,7 @@ cmd_install() {
 	done
 	cmd_deps quiet
 	ensure_key
+	[[ $arch == arm64 ]] || kvm_check
 	if [[ $arch == arm64 ]]; then
 		[[ $distro == ubuntu* && -z $iso ]] || die "--arch arm64 поддерживается только для ubuntu из cloud-образа (без --iso)"
 		find_aarch64 >/dev/null || die "для arm64 нужны qemu-system-aarch64 и UEFI: sudo pacman -S qemu-system-aarch64 edk2-aarch64 / sudo apt install qemu-system-arm qemu-efi-aarch64"
@@ -960,7 +970,8 @@ cmd_install() {
 
 	NAME=$name DIR=$(vm_dir "$name")
 	mkdir -p "$DIR"
-	trap '[[ -f $DIR/vm.conf ]] || rm -rf "$DIR"' EXIT
+	# до первого успешного запуска VM недоделана: при ошибке убираем её, чтобы повтор не упёрся в «уже есть»
+	trap 'rm -rf "$DIR"; [[ $(default_vm) == "$NAME" ]] && rm -f "$LSW_HOME/default"' EXIT
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
 	# порт резервируем сразу: параллельная установка (tui) не должна взять тот же
 	{ flock 9; PORT=$(free_port); echo "$PORT" >"$DIR/port.reserve"; } 9>"$LSW_HOME/port.lock"
@@ -990,11 +1001,11 @@ cmd_install() {
 		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
 	rm -f "$DIR/port.reserve"
-	trap - EXIT
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
 
 	[[ -n $vnc ]] && VNC=$((PORT - 2222 + 10))
 	vm_start
+	trap - EXIT
 	[[ -n $vnc ]] && info "VNC: 127.0.0.1:$((5900 + VNC))"
 
 	if [[ $type == linux ]]; then
