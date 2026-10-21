@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.7.0
+LSW_VERSION=0.7.1
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
