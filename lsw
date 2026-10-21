@@ -67,27 +67,60 @@ EOF
 find_virtiofsd() {
 	# нужен Rust-virtiofsd (--shared-dir); старый C-вариант из qemu 6.x (Ubuntu 22.04) не подходит
 	local p
-	for p in "$(command -v virtiofsd 2>/dev/null)" /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
+	for p in "$(command -v virtiofsd 2>/dev/null)" /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd "$LSW_HOME/bin/virtiofsd"; do
 		[[ -n $p && -x $p ]] && "$p" --help 2>&1 | grep -q -- --shared-dir && { echo "$p"; return; }
 	done
 	return 1
 }
+
+# Где нет пакета virtiofsd (Ubuntu 22.04, Debian 11), берём статический бинарник (musl) из релиза
+# virtiofsd и кладём в $LSW_HOME/bin — без sudo. Версия и sha256 закреплены.
+VIRTIOFSD_VER=1.14.0
+VIRTIOFSD_URL=https://gitlab.com/-/project/21523468/uploads/f505704014ae7a816e515f2a05a93d8b/virtiofsd-v$VIRTIOFSD_VER.zip
+VIRTIOFSD_SHA256=2e4fe9571f492b00baa34bc4e708e950039c5da05b830b31a8d179cb6ac8978e
+
+fetch_virtiofsd() {
+	local tmp bin=$LSW_HOME/bin/virtiofsd
+	[[ $(uname -m) == x86_64 ]] || return 1
+	tmp=$(mktemp -d)
+	info "virtiofsd не найден — скачиваю virtiofsd $VIRTIOFSD_VER в ${bin/#"$HOME"/\~}"
+	if curl -fsSL -o "$tmp/v.zip" "$VIRTIOFSD_URL" &&
+		[[ $(sha256sum "$tmp/v.zip" | cut -d' ' -f1) == "$VIRTIOFSD_SHA256" ]] &&
+		{ unzip -q -o -j "$tmp/v.zip" '*/virtiofsd' -d "$tmp" 2>/dev/null ||
+			python3 -I -c 'import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+n = [i for i in z.namelist() if i.endswith("/virtiofsd")][0]
+open(sys.argv[2], "wb").write(z.read(n))' "$tmp/v.zip" "$tmp/virtiofsd"; } 2>/dev/null &&
+		chmod +x "$tmp/virtiofsd" && "$tmp/virtiofsd" --help 2>&1 | grep -q -- --shared-dir; then
+		mkdir -p "${bin%/*}"
+		mv "$tmp/virtiofsd" "$bin"
+		rm -rf "$tmp"
+		return 0
+	fi
+	rm -rf "$tmp"
+	warn "не удалось скачать virtiofsd ($VIRTIOFSD_URL)"
+	return 1
+}
+
+ensure_virtiofsd() { find_virtiofsd >/dev/null || fetch_virtiofsd; }
+
+apt_has() { command -v apt-cache >/dev/null && apt-cache show "$1" >/dev/null 2>&1; }
 
 cmd_deps() {
 	local missing=() c
 	for c in qemu-system-x86_64 qemu-img xorriso socat ssh ssh-keygen curl; do
 		command -v "$c" >/dev/null || missing+=("$c")
 	done
-	find_virtiofsd >/dev/null || missing+=(virtiofsd)
+	ensure_virtiofsd || missing+=(virtiofsd)
 	[[ -w /dev/kvm ]] || warn "/dev/kvm недоступен для записи — без KVM будет очень медленно"
 	if ((${#missing[@]})); then
 		warn "не хватает: ${missing[*]}"
 		if command -v apt-get >/dev/null; then
-			echo "  sudo apt install qemu-system-x86 qemu-utils ipxe-qemu virtiofsd xorriso socat openssh-client curl" >&2
+			echo "  sudo apt install qemu-system-x86 qemu-utils ipxe-qemu$(apt_has virtiofsd && echo ' virtiofsd') xorriso socat openssh-client curl" >&2
 		elif command -v dnf >/dev/null; then
 			echo "  sudo dnf install qemu-kvm qemu-img virtiofsd xorriso socat openssh-clients curl" >&2
 		else
-			echo "  sudo pacman -S --needed qemu-base libisoburn socat 7zip openssh curl" >&2
+			echo "  sudo pacman -S --needed qemu-base virtiofsd libisoburn socat 7zip openssh curl" >&2
 		fi
 		[[ ${1:-} == quiet ]] && exit 1
 		return 1
@@ -469,6 +502,7 @@ extract_kernel() { # iso -> $DIR/boot/{vmlinuz,initrd}
 
 start_virtiofsd() {
 	local bin lim ro=()
+	ensure_virtiofsd || true
 	bin=$(find_virtiofsd) || die "virtiofsd не найден (выключи общую папку: lsw share $NAME off)"
 	[[ -d $SHARE ]] || die "папка для общего доступа не существует: $SHARE (lsw share $NAME off)"
 	if [[ ${SHARE_RO:-0} == 1 ]]; then

@@ -72,7 +72,7 @@ apt_install() {
 	if apt-cache "${opts[@]}" show virtiofsd >/dev/null 2>&1; then
 		pkgs+=(virtiofsd)
 	else
-		warn "нет пакета virtiofsd (он есть с Ubuntu 24.04 / Debian 12) — общие папки в Linux-гостях работать не будут"
+		info "пакета virtiofsd нет (появился в Ubuntu 24.04 / Debian 12) — lsw скачает его сам (lsw deps)"
 	fi
 	info "ставлю: ${pkgs[*]}"
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" install -y -qq --no-install-recommends "${pkgs[@]}"
