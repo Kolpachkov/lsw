@@ -156,7 +156,7 @@ load_vm() {
 	NAME=$1
 	DIR=$(vm_dir "$NAME")
 	[[ -f $DIR/vm.conf ]] || die "VM '$NAME' не найдена (lsw list)"
-	ARCH=amd64 # VM до 0.5.0 — без ARCH в vm.conf
+	ARCH=amd64 WINBUILD="" # VM до 0.5.0 — без ARCH в vm.conf; WINBUILD — узнаётся при первом lsw shell
 	# shellcheck disable=SC1091
 	source "$DIR/vm.conf"
 }
@@ -352,7 +352,11 @@ iso_label() { # вид iso -> подпись
 	ubuntu)
 		v=$(grep -oE '[0-9]{2}\.[0-9]{2}' <<<"$f" | head -1)
 		echo "Ubuntu Server${v:+ $v}" ;;
-	windows) if grep -qiE 'win(dows)?[ _.-]?11' <<<"$f"; then echo "Windows 11"; else echo "Windows 10"; fi ;;
+	windows)
+		v=$(win_release "$2")
+		if [[ $v == 11 ]] || grep -qiE 'win(dows)?[ _.-]?11' <<<"$f"; then echo "Windows 11"
+		elif win_old "$v"; then echo "Windows 10 $v — старая, кривой терминал"
+		else echo "Windows 10${v:+ $v}"; fi ;;
 	desktop) echo "Ubuntu Desktop (нужен Server)" ;;
 	arm) echo "ISO arm64 — не поддерживается" ;;
 	*) echo ISO ;;
@@ -621,6 +625,20 @@ win_lang() { # iso -> en-US / ru-RU / ...
 	fi
 	echo "$lang"
 }
+
+win_release() { # iso -> версия Windows по sources/idwbinfo.txt (1507 … 1809, 2004+, 11) или пусто
+	local z b
+	z=$(find_7z) || return 0
+	b=$("$z" e -so "$1" sources/idwbinfo.txt 2>/dev/null | sed -n 's/^BuildBranch=\([a-z0-9]*\).*/\1/p' | tr -d '\r' | head -1) || true
+	case $b in
+	th1) echo 1507 ;; th2) echo 1511 ;; rs1) echo 1607 ;; rs2) echo 1703 ;; rs3) echo 1709 ;; rs4) echo 1803 ;;
+	rs5) echo 1809 ;; 19h1) echo 1903 ;; vb) echo 2004+ ;; co | ni | ge | br | dt) echo 11 ;;
+	esac
+}
+
+# до 1809 в Windows нет ConPTY: Win32-OpenSSH рисует консоль сам — пустые экраны, ширина 80, перерисовки
+win_old() { [[ $1 =~ ^1[5-8]0[0-9]$ && $1 != 1809 ]]; }
+WIN_OLD_MSG="в Windows до 1809 нет ConPTY — терминал по ssh будет с артефактами (пустые экраны, ширина 80 колонок). Лучше ISO Windows 10 22H2: https://www.microsoft.com/software-download/windows10ISO"
 
 win_check_iso() {
 	local z
@@ -992,6 +1010,9 @@ cmd_install() {
 		type=windows
 		[[ -n $iso && -f $iso ]] || die "для Windows нужен --iso путь/к/Win10.iso"
 		win_check_iso "$iso"
+		local wv
+		wv=$(win_release "$iso")
+		! win_old "$wv" || warn "ISO — Windows 10 $wv: $WIN_OLD_MSG"
 	else
 		distro_url "$distro" >/dev/null || die "неизвестный дистрибутив: $distro"
 		if [[ -n $iso ]]; then
@@ -1162,6 +1183,13 @@ cmd_shell() {
 		fi
 		exec "${SSH[@]}" -t "$VMUSER@127.0.0.1" "$cd exec \$SHELL -l"
 	else
+		if [[ -z ${WINBUILD:-} ]]; then # сборку спрашиваем один раз
+			WINBUILD=$("${SSH[@]}" "$VMUSER@127.0.0.1" '[Environment]::OSVersion.Version.Build' </dev/null 2>/dev/null | tr -dc 0-9) || true
+			[[ -z $WINBUILD ]] || conf_set WINBUILD "$WINBUILD"
+		fi
+		if [[ -n ${WINBUILD:-} ]] && ((WINBUILD < 17763)); then
+			printf '\e[2m%s\e[0m\n' "Windows сборки $WINBUILD: $WIN_OLD_MSG" >&2
+		fi
 		exec "${SSH[@]}" -t "$VMUSER@127.0.0.1"
 	fi
 }
@@ -2079,6 +2107,15 @@ t_img_new() { # вид дистрибутив арх путь — спросит
 	args=(install "$d" "$name")
 	[[ $k == cloud ]] || args+=(--iso "$p")
 	[[ $a == arm64 ]] && args+=(--arch arm64)
+	t_prompt "Общая папка (пусто — нет, :ro — чтение): " || return
+	if [[ -n $REPLY ]]; then
+		[[ -d ${REPLY%:ro} ]] || { t_msg 1 "нет папки ${REPLY%:ro}"; return; }
+		args+=(--share "$REPLY")
+		if [[ $k == windows ]] && ! command -v smbd >/dev/null && [[ ! -x /usr/sbin/smbd ]]; then
+			t_msg 3 "для папки в Windows нужен samba на хосте: sudo apt install samba / sudo pacman -S samba"
+		fi
+	fi
+	hint=${hint% --share ~/Work}
 	t_prompt "Опции, можно пусто ($hint): " || return
 	read -ra extra <<<"$REPLY"
 	for e in "${!extra[@]}"; do [[ ${extra[e]} == '~'* ]] && extra[e]=$HOME${extra[e]:1}; done
