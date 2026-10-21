@@ -192,6 +192,9 @@ is_running() { qemu_pid >/dev/null; }
 # порты хоста, занятые VM (ssh и проброшенные): "порт vm" по строке
 vm_host_ports() {
 	local c
+	for c in "$VMS"/*/port.reserve; do # VM ещё ставится: vm.conf нет, порт уже занят
+		[[ -f $c && ! -f ${c%/*}/vm.conf ]] && echo "$(<"$c") $(basename "${c%/*}")"
+	done
 	for c in "$VMS"/*/vm.conf; do
 		[[ -f $c ]] || continue
 		(
@@ -842,19 +845,19 @@ qmp_hmp() { # команда монитора QEMU (hostfwd_add ...); успех
 	return 1
 }
 
-vm_stop() {
-	local pid i
+vm_stop() { # [kill] — сразу, без выключения гостя (VM всё равно удаляется)
+	local pid i n=90
 	pid=$(qemu_pid) || { stop_virtiofsd; return 0; }
 	info "останавливаю $NAME"
-	qmp system_powerdown
-	for i in {1..90}; do
+	if [[ ${1:-} == kill ]]; then n=0; else qmp system_powerdown; fi
+	for ((i = 0; i < n; i++)); do
 		kill -0 "$pid" 2>/dev/null || break
 		sleep 1
 	done
 	if kill -0 "$pid" 2>/dev/null; then
-		warn "гость не выключился за 90 с — выключаю принудительно"
+		((n)) && warn "гость не выключился за 90 с — выключаю принудительно"
 		qmp quit
-		sleep 1
+		for i in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
 		kill "$pid" 2>/dev/null || true
 	fi
 	ssh_close
@@ -959,7 +962,9 @@ cmd_install() {
 	mkdir -p "$DIR"
 	trap '[[ -f $DIR/vm.conf ]] || rm -rf "$DIR"' EXIT
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
-	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem PORT=$(free_port) VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
+	# порт резервируем сразу: параллельная установка (tui) не должна взять тот же
+	{ flock 9; PORT=$(free_port); echo "$PORT" >"$DIR/port.reserve"; } 9>"$LSW_HOME/port.lock"
+	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
 
 	if [[ $type == linux && -n $iso ]]; then
 		info "Ubuntu Server ISO ($distro), диск $disk"
@@ -984,6 +989,7 @@ cmd_install() {
 	{
 		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
+	rm -f "$DIR/port.reserve"
 	trap - EXIT
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
 
@@ -1422,7 +1428,7 @@ cmd_rm() {
 		read -rp "Удалить VM '$n' вместе с диском? [y/N] " a
 		[[ $a == [yYдД]* ]] || exit 1
 	fi
-	vm_stop
+	vm_stop kill
 	rm -rf "$DIR"
 	[[ $(default_vm) == "$n" ]] && rm -f "$LSW_HOME/default"
 	info "удалена: $n"
@@ -1585,7 +1591,7 @@ t_bg() { # имя что команда... — в фоне; VM в списке �
 	shift 2
 	[[ -z ${T_JOB[$n]:-} ]] || { t_msg 1 "$n: уже идёт ${T_JOBWHAT[$n]}"; return 1; }
 	log=$(mktemp)
-	"$SELF" "$@" </dev/null >"$log" 2>&1 &
+	setsid "$SELF" "$@" </dev/null >"$log" 2>&1 & # переживёт выход из tui и закрытие терминала
 	T_JOB[$n]=$! T_JOBLOG[$n]=$log T_JOBWHAT[$n]=$what
 	t_msg 3 "$n: $what…"
 }
@@ -1600,7 +1606,7 @@ t_reap() { # закончившиеся фоновые задачи -> стро�
 		if ((rc)); then T_MSG="$n: ${T_JOBWHAT[$n]} не удалась — $T_MSG"
 		elif ((T_MSGC == 2)); then T_MSG="$n: ${T_JOBWHAT[$n]} — готово"; fi
 		rm -f "${T_JOBLOG[$n]}"
-		unset "T_JOB[$n]" "T_JOBLOG[$n]" "T_JOBWHAT[$n]"
+		unset "T_JOB[$n]" "T_JOBLOG[$n]" "T_JOBWHAT[$n]" "T_INST[$n]"
 	done
 }
 
@@ -1752,6 +1758,10 @@ t_load() { # список VM и их состояния; выделение де
 			echo "$s $DISTRO$([[ $ARCH == arm64 ]] && echo /arm64)"
 		)")
 	done
+	for n in "${!T_INST[@]}"; do # ставятся из tui, vm.conf ещё нет
+		[[ -f $(vm_dir "$n")/vm.conf ]] && continue
+		T_NAMES+=("$n") T_INFO+=("creating ${T_INST[$n]}")
+	done
 	for i in "${!T_NAMES[@]}"; do [[ ${T_NAMES[i]} == "$T_CUR" ]] && T_SEL=$i; done
 	((T_SEL >= ${#T_NAMES[@]})) && T_SEL=$((${#T_NAMES[@]} - 1))
 	((T_SEL < 0)) && T_SEL=0
@@ -1764,8 +1774,25 @@ t_dur() { # секунды -> 2д 3ч / 1:02:03
 	else printf '%d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60)); fi
 }
 
+t_logtail() { # файл N -> последние N непустых строк (прогресс через \r — последнее состояние)
+	[[ -f $1 ]] || return 0
+	# полоска curl (### 42.0%) — одной строкой и только последнее значение
+	tail -c 16384 "$1" | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/^:: //' | grep -E '[[:alnum:]]' |
+		awk '/^[#=O. -]*[0-9.]+%[[:space:]]*$/ { sub(/^[#=O. -]*/, ""); p = "загрузка " $0; next }
+			p != "" { print p; p = "" } { print } END { if (p != "") print p }' | tail -n "$2"
+}
+
 t_detail() { # имя -> строки "вид|текст" для правой панели
 	(
+		local ilog l
+		ilog=$(t_ilog "$1")
+		if [[ ! -f $(vm_dir "$1")/vm.conf ]]; then # ещё создаётся: только ход установки
+			echo "S|2|создаётся"
+			echo "B|"
+			echo "H|Установка"
+			t_logtail "$ilog" 12 | while IFS= read -r l; do echo "L|$l"; done
+			exit 0
+		fi
 		load_vm "$1" 2>/dev/null || exit 0
 		FWDS=${FWDS:-}
 		local pid up rss sz share f p a h g snaps
@@ -1799,6 +1826,11 @@ t_detail() { # имя -> строки "вид|текст" для правой п
 		echo "H|Снимки"
 		snaps=$(qemu-img snapshot -l -U "$DIR/disk.qcow2" 2>/dev/null | awk 'NR > 2 {printf "T|%-22s %s %s\n", $2, $5, substr($6, 1, 5)}')
 		if [[ -n $snaps ]]; then echo "$snaps"; else echo "D|нет"; fi
+		if [[ $INSTALLED != 1 && -f $ilog ]]; then
+			echo "B|"
+			echo "H|Установка"
+			t_logtail "$ilog" 8 | while IFS= read -r l; do echo "L|$l"; done
+		fi
 	)
 }
 
@@ -1847,6 +1879,7 @@ t_draw() {
 			H) R+=("$ESC[1;36m$(t_pad "$a" "$rw")$ESC[0m") ;;
 			T) R+=("  $(t_pad "$a" $((rw - 2)))") ;;
 			D) R+=("  $ESC[2m$(t_pad "$a" $((rw - 2)))$ESC[0m") ;;
+			L) R+=("  $ESC[2m$(t_pad "$a${b:+|$b}" $((rw - 2)))$ESC[0m") ;;
 			B) R+=("") ;;
 			esac
 		done < <(t_detail "$T_CUR")
@@ -1962,7 +1995,33 @@ t_img_new() { # вид дистрибутив арх путь — спросит
 	t_prompt "Опции, можно пусто ($hint): " || return
 	read -ra extra <<<"$REPLY"
 	for e in "${!extra[@]}"; do [[ ${extra[e]} == '~'* ]] && extra[e]=$HOME${extra[e]:1}; done
-	t_ext --pause "$SELF" "${args[@]}" "${extra[@]}" && T_CUR=$name
+	t_install_job "$name" "$([[ $k == cloud ]] && echo "$d" || echo "$d iso")$([[ $a == arm64 ]] && echo /arm64)" "${args[@]}" "${extra[@]}"
+}
+
+t_ilog() { echo "$LSW_HOME/logs/install-$1.log"; } # лог установки: живёт, пока VM не установлена
+
+t_install_job() { # имя подпись команда... — установка в фоне, ход виден справа
+	local n=$1 label=$2 log
+	shift 2
+	[[ -z ${T_JOB[$n]:-} ]] || { t_msg 1 "$n: уже идёт ${T_JOBWHAT[$n]}"; return 1; }
+	log=$(t_ilog "$n")
+	mkdir -p "${log%/*}"
+	# setsid: установка переживёт выход из tui и закрытие терминала
+	setsid "$SELF" "$@" </dev/null >"$log" 2>&1 &
+	T_JOB[$n]=$! T_JOBLOG[$n]=$log T_JOBWHAT[$n]=установка T_INST[$n]=$label
+	T_CUR=$n
+	t_msg 3 "$n: установка… (ход — справа, d — прервать)"
+}
+
+t_abort_install() { # имя — прервать установку из tui и удалить VM
+	local n=$1 pid=${T_JOB[$1]}
+	t_confirm "Прервать установку $n и удалить VM?" || return
+	kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+	rm -f "${T_JOBLOG[$n]}"
+	unset "T_JOB[$n]" "T_JOBLOG[$n]" "T_JOBWHAT[$n]" "T_INST[$n]"
+	if [[ -f $(vm_dir "$n")/vm.conf ]]; then t_bg "$n" удаление rm "$n" -f
+	else rm -rf "$(vm_dir "$n")"; t_msg 2 "$n: установка прервана"; fi
 }
 
 t_install() { # новая VM из образа: облачные (скачанные и нет) и найденные ISO
@@ -2054,7 +2113,7 @@ t_help() {
 		"l          лог консоли (выход Ctrl+C)" \
 		"*          сделать VM основной (lsw без имени)" \
 		"i          новая VM из образа (там: u — скачать, d — удалить)" \
-		"d          удалить VM" \
+		"d          удалить VM (во время установки — прервать её)" \
 		"q          выйти (VM продолжат работать)" || true
 }
 
@@ -2063,7 +2122,7 @@ cmd_tui() {
 	set +eu # интерфейс не должен падать из-за ((...)) == 0 или пустых переменных
 	[[ $(locale charmap 2>/dev/null) == UTF-8 ]] || export LC_ALL=C.UTF-8
 	SELF=$(readlink -f "$0")
-	declare -gA T_JOB=() T_JOBLOG=() T_JOBWHAT=()
+	declare -gA T_JOB=() T_JOBLOG=() T_JOBWHAT=() T_INST=()
 	T_SEL=0 T_CUR=$(default_vm) T_DEF='' T_MSG='' T_MSGC=2 T_KEY='' PICK=0
 	ensure_key
 	trap 't_screen off' EXIT
@@ -2083,12 +2142,27 @@ cmd_tui() {
 		down | j) ((T_SEL < ${#T_NAMES[@]} - 1)) && ((T_SEL++)); reload=0 ;;
 		home | g | pgup) T_SEL=0 reload=0 ;;
 		end | G | pgdn) T_SEL=$((${#T_NAMES[@]} - 1)) reload=0 ;;
-		q | Q | intr) exit 0 ;;
+		q | Q | intr)
+			if ((${#T_JOB[@]})); then
+				local j jobs=''
+				for j in "${!T_JOB[@]}"; do jobs+="${jobs:+, }$j — ${T_JOBWHAT[$j]}"; done
+				t_confirm "Идёт: $jobs. Выйти? Продолжится в фоне" || continue
+			fi
+			exit 0 ;;
 		'?' | h) t_help ;;
 		i) t_install ;;
 		*)
 			if [[ -z $n ]]; then
 				[[ $T_KEY == enter ]] && t_install
+				continue
+			fi
+			if [[ -n ${T_INST[$n]:-} ]]; then # ставится из tui
+				case $T_KEY in
+				d | x) t_abort_install "$n" ;;
+				enter | l) [[ $st == creating ]] && t_msg 3 "$n ещё создаётся — ход установки справа" || t_ext "$SELF" logs "$n" ;;
+				s | r | e | p | n | f | c | '*') t_msg 3 "$n ещё ставится — подожди (d — прервать)" ;;
+				esac
+				((reload)) || T_CUR=${T_NAMES[T_SEL]:-}
 				continue
 			fi
 			case $T_KEY in
