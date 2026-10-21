@@ -27,6 +27,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --arch arm64    ARM-гость (только ubuntu*, без KVM — программная эмуляция, в разы медленнее)
       --share DIR[:ro]  открыть папку хоста в госте как /mnt/host (:ro — только чтение);
                         по умолчанию VM изолирована и ничего с хоста не видит
+      --user NAME     пользователь в госте (по умолчанию — как на хосте; ivan@corp.ru -> ivan)
       --password P    пароль пользователя (по умолчанию = имя пользователя)
       --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
       --edition N     индекс редакции в install.wim/esd
@@ -237,6 +238,19 @@ ssh_close() { # закрыть фоновое мастер-соединение 
 ssh_ready() {
 	ssh_opts
 	"${SSH[@]}" -o ConnectTimeout=3 "$VMUSER@127.0.0.1" exit </dev/null >/dev/null 2>&1
+}
+
+ssh_why() { # почему ssh не пускает — текст ошибки и что он значит
+	local e
+	ssh_opts
+	# свои опции — первыми (ssh берёт первое значение), без мастер-соединения
+	e=$(ssh -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 "${SSH[@]:1}" "$VMUSER@127.0.0.1" exit </dev/null 2>&1 >/dev/null | tail -1) || true
+	case $e in
+	*'Permission denied'*) echo "$e — в госте нет пользователя $VMUSER или ключа (cloud-init не отработал)" ;;
+	*refused* | *'closed by'* | *reset*) echo "${e:-нет ответа} — sshd в госте не запущен" ;;
+	'') echo "соединение есть, но команда не выполнилась" ;;
+	*) echo "$e" ;;
+	esac
 }
 
 wait_ssh() { # таймаут в секундах
@@ -909,11 +923,24 @@ ensure_up() { # запустить при необходимости и дожд
 
 # ---------- команды ----------
 
+guest_user() { # имя -> допустимое имя пользователя гостя
+	# доменные логины (ivan@corp.ru, CORP\Ivan) useradd в Arch и Windows не примет — берём короткое имя
+	local u=${1%%@*}
+	u=${u##*\\}
+	u=${u,,}
+	u=${u//[^a-z0-9._-]/-}
+	[[ $u =~ [a-z0-9] ]] || u='' # не латиница (Иван) — общее имя
+	[[ -z $u || $u == [a-z_]* ]] || u=u$u
+	u=${u:0:32}
+	[[ -z $u || $u == root ]] && u=user
+	echo "$u"
+}
+
 cmd_install() {
 	local distro=${1:-}
 	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
 	shift
-	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass=$USER iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
 		case $1 in
@@ -923,6 +950,7 @@ cmd_install() {
 		--share) parse_share "$2"; share=$PSHARE share_ro=$PSHARE_RO; shift ;;
 		--no-share) share='' ;;
 		--password) pass=$2; shift ;;
+		--user) user=$2; shift ;;
 		--iso) iso=$(realpath "$2"); shift ;;
 		--key) key=$2; shift ;;
 		--edition) edition=$2; shift ;;
@@ -935,6 +963,8 @@ cmd_install() {
 		esac
 		shift
 	done
+	user=$(guest_user "$user")
+	[[ -n $pass ]] || pass=$user
 	cmd_deps quiet
 	ensure_key
 	[[ $arch == arm64 ]] || kvm_check
@@ -975,7 +1005,7 @@ cmd_install() {
 	printf '%s' "$pass" >"$DIR/password" && chmod 600 "$DIR/password"
 	# порт резервируем сразу: параллельная установка (tui) не должна взять тот же
 	{ flock 9; PORT=$(free_port); echo "$PORT" >"$DIR/port.reserve"; } 9>"$LSW_HOME/port.lock"
-	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem VMUSER=$USER SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
+	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem VMUSER=$user SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
 
 	if [[ $type == linux && -n $iso ]]; then
 		info "Ubuntu Server ISO ($distro), диск $disk"
@@ -1014,7 +1044,7 @@ cmd_install() {
 			vm_start
 		fi
 		info "первая загрузка и cloud-init...$([[ $ARCH == arm64 ]] && echo ' (arm64 под эмуляцией: 5–15 минут)')"
-		wait_boot 300 || die "гость не поднял ssh за $([[ $ARCH == arm64 ]] && echo 20 || echo 5) мин. Последнее в консоли: $(console_line 200). Весь лог: lsw logs $name"
+		wait_boot 300 || die "гость не пустил по ssh за $([[ $ARCH == arm64 ]] && echo 20 || echo 5) мин. ssh: $(ssh_why). Консоль: $(console_line 200). Весь лог: lsw logs $name"
 		info "ssh есть, жду конца cloud-init (пользователь, ключи, размер диска)"
 		ssh_opts
 		"${SSH[@]}" "$VMUSER@127.0.0.1" 'cloud-init status --wait >/dev/null 2>&1 || true'
