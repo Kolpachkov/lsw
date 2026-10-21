@@ -459,6 +459,15 @@ growpart: {mode: auto, devices: ['/']}
 EOF
 	# в cloud-образе Ubuntu пустые списки apt; на Arch не делаем -Sy (частичное обновление)
 	if [[ $DISTRO == ubuntu* ]]; then echo 'package_update: true'; fi
+	# Arch: sshd ждёт pacman-init -> time-sync.target -> systemd-time-wait-sync, т.е. синхронизации по NTP.
+	# Где NTP закрыт (корпоративные сети), ждёт вечно и sshd не стартует. Часы гостя и так идут от хоста (kvm-clock).
+	if [[ $DISTRO == arch ]]; then
+		cat <<'EOF'
+bootcmd:
+  - systemctl mask systemd-time-wait-sync.service
+  - systemctl stop --no-block systemd-time-wait-sync.service
+EOF
+	fi
 	# запись в fstab есть всегда (nofail): папку можно включить позже через lsw share
 	cat <<'EOF'
 runcmd:
