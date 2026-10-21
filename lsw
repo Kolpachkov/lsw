@@ -221,7 +221,10 @@ free_port() {
 # ---------- ssh ----------
 
 ssh_opts() {
-	SSH=(ssh -i "$KEY" -p "$PORT"
+	# -F /dev/null: чужие ~/.ssh/config и /etc/ssh/ssh_config.d (ProxyJump на все хосты, урезанные
+	# алгоритмы на рабочих машинах) не должны ломать ssh в гостя; IdentitiesOnly — без ключей из агента
+	# (их перебор упирается в MaxAuthTries раньше нашего ключа)
+	SSH=(ssh -F /dev/null -i "$KEY" -p "$PORT" -o IdentitiesOnly=yes -o SendEnv='LANG LC_*'
 		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 		-o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30
 		# одно соединение на VM: повторные run/shell не делают новый ssh-handshake
@@ -244,7 +247,9 @@ ssh_why() { # почему ssh не пускает — текст ошибки �
 	local e
 	ssh_opts
 	# свои опции — первыми (ssh берёт первое значение), без мастер-соединения
-	e=$(ssh -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 "${SSH[@]:1}" "$VMUSER@127.0.0.1" exit </dev/null 2>&1 >/dev/null | tail -1) || true
+	# LogLevel=INFO: «Connection closed by …» на уровне ERROR не печатается
+	e=$(ssh -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=5 -o LogLevel=INFO "${SSH[@]:1}" "$VMUSER@127.0.0.1" exit </dev/null 2>&1 >/dev/null |
+		tr -d '\r' | grep -v '^Warning: Permanently added' | tail -1) || true
 	case $e in
 	*'Permission denied'*) echo "$e — в госте нет пользователя $VMUSER или ключа (cloud-init не отработал)" ;;
 	*refused* | *'closed by'* | *reset*) echo "${e:-нет ответа} — sshd в госте не запущен" ;;
@@ -1067,12 +1072,12 @@ cmd_install() {
 console_line() { # [ширина] -> последняя осмысленная строка серийной консоли гостя
 	# OSC/DCS (запросы терминала от systemd: ESC P…ESC \\, ESC ]…BEL), CSI, прочие ESC-пары
 	tail -c 4096 "$DIR/console.log" 2>/dev/null | tr '\r' '\n' |
-		sed -E 's/\x1b[]P_^][^\x07\x1b]*(\x07|\x1b\\)?//g; s/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b.//g; s/[[:cntrl:]]//g' |
+		LC_ALL=C sed -E 's/\x1b[]P_^][^\x07\x1b]*(\x07|\x1b\\)?//g; s/\x1b\[[0-9;?<=>]*[ -\/]*[@-~]//g; s/\x1b.//g; s/[[:cntrl:]]//g' |
 		grep -E '[[:alnum:]]' | tail -1 | cut -c1-"${1:-60}" || true
 }
 
 wait_boot() { # таймаут — как wait_ssh, но с ходом загрузки: время и что гость пишет в консоль
-	local t=$1 t0=$SECONDS deadline cols
+	local t=$1 t0=$SECONDS deadline cols line login=0 why='' next=0
 	[[ ${ARCH:-amd64} == arm64 ]] && t=$((t * 4))
 	deadline=$((SECONDS + t))
 	cols=$(( $(tput cols 2>/dev/null || echo 80) - 12 ))
@@ -1082,7 +1087,14 @@ wait_boot() { # таймаут — как wait_ssh, но с ходом загр�
 			printf '\r\e[K' >&2
 			return 1
 		fi
-		printf '\r\e[K  %d:%02d  %s' $(((SECONDS - t0) / 60)) $(((SECONDS - t0) % 60)) "$(console_line "$cols")" >&2
+		line=$(console_line "$cols")
+		# гость уже ждёт входа (или грузится подозрительно долго), а ssh не пускает — показываем, что отвечает ssh
+		[[ $line == *'login:'* ]] && ((login == 0)) && login=$SECONDS
+		if (((login && SECONDS - login >= 30) || SECONDS - t0 >= 90)) && ((SECONDS >= next)); then
+			why=$(ssh_why) next=$((SECONDS + 15))
+		fi
+		[[ -z $why ]] || line="ssh: $why"
+		printf '\r\e[K  %d:%02d  %s' $(((SECONDS - t0) / 60)) $(((SECONDS - t0) % 60)) "${line:0:cols}" >&2
 		sleep 2
 	done
 	printf '\r\e[K' >&2
@@ -1181,7 +1193,7 @@ cmd_ssh_config() {
 		[[ -z ${1:-} || $1 == "$n" ]] || continue
 		(
 			load_vm "$n"
-			printf 'Host lsw-%s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n\n' \
+			printf 'Host lsw-%s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n\n' \
 				"$n" "$PORT" "$VMUSER" "$KEY"
 		)
 	done
@@ -1844,6 +1856,7 @@ t_logtail() { # файл N -> последние N непустых строк (
 	# полоска curl (### 42.0%) — одной строкой и только последнее значение
 	tail -c 16384 "$1" | tr '\r' '\n' | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/^:: //' | grep -E '[[:alnum:]]' |
 		awk '/^[#=O. -]*[0-9.]+%[[:space:]]*$/ { sub(/^[#=O. -]*/, ""); p = "загрузка " $0; next }
+			/^  [0-9]+:[0-9][0-9]  / { p = $0; next }
 			p != "" { print p; p = "" } { print } END { if (p != "") print p }' | tail -n "$2"
 }
 
