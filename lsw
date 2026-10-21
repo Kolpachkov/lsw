@@ -51,6 +51,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       0.0.0.0:8080:80  — доступно из сети;  8080/udp — UDP;  lsw port [имя] rm 8080
   lsw snapshot [имя] [list|save [метка]|restore <метка> [-f]|rm <метка>]
                             снимки диска; save работает и на запущенной VM
+  lsw code [имя] [папка]    VS Code в госте через Remote-SSH (как code . в WSL); из общей папки — та же папка
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
   lsw images                скачанные облачные образы и найденные ISO (кеш, ~/Downloads, $LSW_ISO_DIRS)
@@ -1096,6 +1097,7 @@ cmd_install() {
 		trap - INT
 	fi
 	conf_set INSTALLED 1
+	ssh_config_sync
 	info "готово: lsw shell $name   (пользователь $VMUSER, пароль в $DIR/password)"
 }
 
@@ -1222,18 +1224,85 @@ cmd_console() {
 	exec socat STDIO,rawer,escape=0x1d "UNIX-CONNECT:$DIR/console.sock"
 }
 
+ssh_host_block() { # после load_vm -> блок Host lsw-<имя> для ssh/scp/rsync/VS Code
+	# ProxyJump/ProxyCommand none: «Host *» с прокси из чужого конфига не должен уводить 127.0.0.1 в сторону
+	printf 'Host lsw-%s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  ProxyJump none\n  ProxyCommand none\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n\n' \
+		"$NAME" "$PORT" "$VMUSER" "$KEY"
+}
+
 cmd_ssh_config() {
 	local d n
 	ensure_key
 	for d in "$VMS"/*/; do
 		n=$(basename "$d")
+		[[ -f $d/vm.conf ]] || continue
 		[[ -z ${1:-} || $1 == "$n" ]] || continue
-		(
-			load_vm "$n"
-			printf 'Host lsw-%s\n  HostName 127.0.0.1\n  Port %s\n  User %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n\n' \
-				"$n" "$PORT" "$VMUSER" "$KEY"
-		)
+		(load_vm "$n" && ssh_host_block)
 	done
+}
+
+SSH_INCLUDE=$LSW_HOME/ssh_config # хосты всех VM; подключается к ~/.ssh/config через Include (lsw code)
+
+ssh_config_sync() { # [force] — переписать $SSH_INCLUDE; без force — только если им уже пользуются
+	[[ ${1:-} == force || -f $SSH_INCLUDE ]] || return 0
+	{
+		echo "# создаётся lsw (lsw code, lsw ssh-config) — правки перезапишутся"
+		cmd_ssh_config
+	} >"$SSH_INCLUDE.new" && mv -f "$SSH_INCLUDE.new" "$SSH_INCLUDE"
+}
+
+ssh_include() { # Include $SSH_INCLUDE в начале ~/.ssh/config (внутри блока Host он бы не работал)
+	local f=$HOME/.ssh/config line="Include $SSH_INCLUDE"
+	[[ -f $f ]] && grep -qxF "$line" "$f" && return
+	mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+	{
+		echo "# lsw: хосты lsw-<имя> для VS Code Remote-SSH, scp, rsync"
+		echo "$line"
+		echo
+		if [[ -f $f ]]; then cat "$f"; fi
+	} >"$f.lsw-new"
+	chmod 600 "$f.lsw-new" && mv -f "$f.lsw-new" "$f"
+	info "добавил в ~/.ssh/config: $line"
+}
+
+find_editor() { # VS Code или совместимый редактор
+	local c
+	for c in ${LSW_EDITOR:-} code code-insiders cursor codium code-oss; do
+		command -v "$c" >/dev/null && { echo "$c"; return; }
+	done
+	return 1
+}
+
+cmd_code() { # [имя] [папка в госте] — VS Code через Remote-SSH, как code . из WSL
+	local name='' path='' ed ext uri rel
+	if [[ -n ${1:-} && -f $(vm_dir "$1")/vm.conf ]]; then name=$1; shift; fi
+	path=${1:-}
+	load_vm "$(resolve_name "$name")"
+	ed=$(find_editor) || die "не нашёл VS Code (code). Поставь его или укажи редактор: LSW_EDITOR=cursor lsw code"
+	case ${ed##*/} in
+	codium | code-oss) ext=jeanp413.open-remote-ssh ;;
+	cursor) ext=anysphere.remote-ssh ;;
+	*) ext=ms-vscode-remote.remote-ssh ;;
+	esac
+	if ! "$ed" --list-extensions 2>/dev/null | grep -qix "$ext"; then
+		info "ставлю расширение $ext в $ed"
+		"$ed" --install-extension "$ext" >/dev/null 2>&1 || die "не удалось поставить $ext: $ed --install-extension $ext"
+	fi
+	ensure_key
+	ssh_config_sync force
+	ssh_include
+	ensure_up
+	if [[ -z $path ]]; then
+		if [[ $TYPE == linux && -n $SHARE && ( $PWD == "$SHARE" || $PWD == "$SHARE"/* ) ]]; then
+			rel=${PWD#"$SHARE"}
+			path=/mnt/host$rel # как lsw shell: та же папка, что на хосте
+		elif [[ $TYPE == linux ]]; then path=/home/$VMUSER
+		else path=C:/Users/$VMUSER; fi
+	fi
+	[[ $path == [A-Za-z]:* ]] && path=/$path # C:/Users/x -> /C:/Users/x
+	uri="vscode-remote://ssh-remote+lsw-$NAME$path"
+	info "$ed: $NAME → $path"
+	"$ed" --folder-uri "$uri"
 }
 
 parse_share() { # DIR[:ro] -> PSHARE, PSHARE_RO
@@ -1545,6 +1614,7 @@ cmd_rm() {
 	vm_stop kill
 	rm -rf "$DIR"
 	[[ $(default_vm) == "$n" ]] && rm -f "$LSW_HOME/default"
+	ssh_config_sync
 	info "удалена: $n"
 }
 
@@ -1728,6 +1798,8 @@ t_ext() { # [--pause] команда... — на обычном экране т�
 	local pause=0 rc=0 t0=$SECONDS
 	[[ $1 == --pause ]] && { pause=1; shift; }
 	t_screen off
+	# чистый экран: иначе вывод прошлой сессии остаётся, и ConPTY Windows рисует поверх него кашу
+	printf '%s' "$ESC[H$ESC[2J"
 	trap ':' INT # Ctrl+C прерывает команду, а не интерфейс
 	"$@" || rc=$?
 	trap 'T_INTR=1' INT
@@ -1951,7 +2023,7 @@ t_detail() { # имя -> строки "вид|текст" для правой п
 
 t_hints() { # ширина -> строка подсказок, сколько влезет
 	local w=$1 out='' len=0 i k l
-	local hk=('?' помощь q выход '↵' shell s старт/стоп r рестарт e ресурсы p порты n снимки f папка c консоль l логи '*' основная i новая d удалить)
+	local hk=('?' помощь q выход '↵' shell s старт/стоп r рестарт e ресурсы p порты n снимки f папка v code c консоль l логи '*' основная i новая d удалить)
 	for ((i = 0; i < ${#hk[@]}; i += 2)); do
 		k=${hk[i]} l=${hk[i + 1]}
 		((len + ${#k} + ${#l} + 3 > w)) && break
@@ -2235,6 +2307,7 @@ t_help() {
 		"f          общая папка с хостом" \
 		"c          серийная консоль (выход Ctrl+])" \
 		"l          лог консоли (выход Ctrl+C)" \
+		"v          открыть в VS Code (Remote-SSH)" \
 		"*          сделать VM основной (lsw без имени)" \
 		"i          новая VM из образа (там: u — скачать, d — удалить)" \
 		"d          удалить VM (во время установки — прервать её)" \
@@ -2284,7 +2357,7 @@ cmd_tui() {
 				case $T_KEY in
 				d | x) t_abort_install "$n" ;;
 				enter | l) [[ $st == creating ]] && t_msg 3 "$n ещё создаётся — ход установки справа" || t_ext "$SELF" logs "$n" ;;
-				s | r | e | p | n | f | c | '*') t_msg 3 "$n ещё ставится — подожди (d — прервать)" ;;
+				s | r | e | p | n | f | c | v | '*') t_msg 3 "$n ещё ставится — подожди (d — прервать)" ;;
 				esac
 				((reload)) || T_CUR=${T_NAMES[T_SEL]:-}
 				continue
@@ -2305,6 +2378,7 @@ cmd_tui() {
 				if [[ $st == stopped ]]; then t_msg 1 "$n не запущена (s — запустить)"
 				else t_ext "$SELF" console "$n"; fi ;;
 			l) t_ext "$SELF" logs "$n" ;;
+			v) t_bg "$n" "VS Code" code "$n" ;;
 			'*') t_do default "$n" ;;
 			d | x) t_confirm "Удалить VM $n вместе с диском и снимками?" && t_bg "$n" удаление rm "$n" -f ;;
 			esac
@@ -2342,6 +2416,7 @@ main() {
 	logs) load_vm "$(resolve_name "${1:-}")" && tail -n "${2:-100}" -f "$DIR/console.log" ;;
 	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
 	ssh-config) cmd_ssh_config "$@" ;;
+	code | vscode) cmd_code "$@" ;;
 	share) cmd_share "$@" ;;
 	set) cmd_set "$@" ;;
 	port | ports) cmd_port "$@" ;;
