@@ -100,6 +100,37 @@ lsw restart dev                              # изменения применя
 Файлы: `~/.local/share/lsw/vms/<имя>/` (диск, `vm.conf`, логи, сокеты QMP и консоли),
 базовые образы кешируются в `~/.local/share/lsw/cache/`.
 
+## Ресурсы, порты, снимки
+
+```sh
+lsw set dev                          # 2 CPU, 2G RAM, диск 20GiB
+lsw set dev --cpus 4 --mem 8G        # применится после перезапуска (lsw предложит перезапустить)
+lsw set dev --disk +20G              # или --disk 60G; только увеличение
+```
+Диск увеличивается и на запущенной VM: lsw расширяет его, а потом раздел и файловую систему гостя
+(Linux — через cloud-init growpart, Windows — `Resize-Partition` диска C:).
+
+```sh
+lsw port dev 8080                    # 127.0.0.1:8080 хоста → 8080 гостя
+lsw port dev 3000:80                 # 127.0.0.1:3000 → 80
+lsw port dev 0.0.0.0:8080:80         # доступно из сети хоста
+lsw port dev 5353/udp
+lsw port dev                         # список
+lsw port dev rm 3000
+```
+На запущенной VM порт открывается и закрывается сразу, без перезапуска. Порты ниже 1024 хосту без root недоступны.
+В Windows порт нужно ещё открыть в брандмауэре (lsw подскажет команду).
+
+```sh
+lsw snapshot dev save before-upgrade # метка необязательна (по умолчанию дата-время)
+lsw snapshot dev                     # список
+lsw snapshot dev restore before-upgrade   # VM перезапустится; всё после снимка пропадёт
+lsw snapshot dev rm before-upgrade
+```
+Снимки хранятся внутри `disk.qcow2` (qcow2 internal snapshots), отдельных файлов нет. Снимок запущенной VM —
+только диск, без памяти: перед ним lsw делает `sync` в госте, а после restore гость загружается как после
+выключения питания. Снимки держат старые данные, поэтому файл диска растёт: ненужные лучше удалять.
+
 ## Ubuntu с ISO
 
 Обычно ISO не нужен: `lsw install ubuntu` ставит ту же Ubuntu Server из cloud-образа за минуту.

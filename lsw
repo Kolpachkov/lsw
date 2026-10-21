@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.5.0
+LSW_VERSION=0.6.0
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
@@ -43,6 +43,12 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
   lsw logs <имя>            лог консоли
   lsw default <имя>         VM по умолчанию
   lsw share [имя] [DIR[:ro]|off]  показать / сменить общую папку (без имени — VM по умолчанию)
+  lsw set [имя] [--cpus N] [--mem 4G] [--disk 40G|+10G]
+                            показать / изменить ресурсы VM (диск — только увеличить)
+  lsw port [имя] [HOST[:GUEST]] открыть порт гостя на 127.0.0.1:HOST хоста (без порта — список)
+      0.0.0.0:8080:80  — доступно из сети;  8080/udp — UDP;  lsw port [имя] rm 8080
+  lsw snapshot [имя] [list|save [метка]|restore <метка> [-f]|rm <метка>]
+                            снимки диска; save работает и на запущенной VM
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
   lsw pull <дистрибутив>    перекачать базовый образ
@@ -119,11 +125,12 @@ load_vm() {
 }
 
 conf_set() { # key value
-	if grep -q "^$1=" "$DIR/vm.conf"; then
-		sed -i "s|^$1=.*|$1=$(printf %q "$2")|" "$DIR/vm.conf"
-	else
-		printf '%s=%q\n' "$1" "$2" >>"$DIR/vm.conf"
-	fi
+	# без sed: в значении бывают пробелы, \ и | (printf %q)
+	local line
+	line=$(printf '%s=%q' "$1" "$2")
+	{ grep -v "^$1=" "$DIR/vm.conf" || true; echo "$line"; } >"$DIR/vm.conf.new"
+	mv -f "$DIR/vm.conf.new" "$DIR/vm.conf"
+	printf -v "$1" '%s' "$2" # и в текущем процессе, чтобы перезапуск взял новое значение
 }
 
 default_vm() {
@@ -146,9 +153,25 @@ qemu_pid() {
 
 is_running() { qemu_pid >/dev/null; }
 
+# порты хоста, занятые VM (ssh и проброшенные): "порт vm" по строке
+vm_host_ports() {
+	local c
+	for c in "$VMS"/*/vm.conf; do
+		[[ -f $c ]] || continue
+		(
+			FWDS=''
+			# shellcheck disable=SC1090
+			source "$c"
+			n=$(basename "$(dirname "$c")")
+			echo "$PORT $n"
+			for f in $FWDS; do IFS=: read -r _ _ h _ <<<"$f" && echo "$h $n"; done
+		)
+	done
+}
+
 free_port() {
 	local p=2222 used
-	used=$(sed -n 's/^PORT=//p' "$VMS"/*/vm.conf 2>/dev/null || true)
+	used=$(vm_host_ports | cut -d' ' -f1)
 	while grep -qx "$p" <<<"$used" || ss -Hltn "sport = :$p" 2>/dev/null | grep -q .; do
 		((p++))
 	done
@@ -349,7 +372,7 @@ linux_args() {
 		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap"
 		-device virtio-blk-pci,drive=d0,iothread=io0,bootindex=0
 		-drive "file=$DIR/seed.iso,if=virtio,format=raw,readonly=on"
-		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
+		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22$(net_fwds)"
 		-device virtio-net-pci,netdev=n0
 		-device virtio-balloon-pci,free-page-reporting=on
 		-device virtio-rng-pci
@@ -556,7 +579,7 @@ EOF
 }
 
 windows_args() {
-	local net="user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22"
+	local net="user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22$(net_fwds)"
 	if [[ -n $SHARE ]]; then # в Windows: \\10.0.2.4\qemu (QEMU сам запускает smbd от пользователя)
 		if command -v smbd >/dev/null || [[ -x /usr/sbin/smbd ]]; then
 			net+=",smb=$SHARE"
@@ -620,9 +643,30 @@ stop_virtiofsd() {
 	rm -f "$DIR/virtiofsd.pid" "$DIR/vfs.sock"
 }
 
-qmp() {
-	printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1" |
-		socat -t2 - "UNIX-CONNECT:$DIR/qmp.sock" >/dev/null 2>&1 || true
+qmp_raw() { # JSON-команда -> строка ответа QMP ({"return":...} или {"error":...})
+	printf '{"execute":"qmp_capabilities"}\n%s\n' "$1" |
+		socat -t2 - "UNIX-CONNECT:$DIR/qmp.sock" 2>/dev/null | grep -E '"(return|error)"' | tail -1
+}
+
+qmp() { qmp_raw "{\"execute\":\"$1\"}" >/dev/null || true; }
+
+qmp_ok() { # JSON-команда; при ошибке печатает её текст
+	local r
+	r=$(qmp_raw "$1" || true)
+	[[ $r == *'"return"'* ]] && return 0
+	r=${r#*\"desc\": \"}
+	echo "${r%%\"*}"
+	return 1
+}
+
+qmp_hmp() { # команда монитора QEMU (hostfwd_add ...); успех = пустой ответ
+	local r
+	r=$(qmp_raw "{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"$1\"}}" || true)
+	[[ $r =~ \"return\":\ *\"(\\r\\n)?\" ]] && return 0
+	r=${r#*\"return\": \"}
+	r=${r%\"*}
+	echo "${r//\\r\\n/ }"
+	return 1
 }
 
 vm_stop() {
@@ -675,6 +719,7 @@ ensure_up() { # запустить при необходимости и дожд
 	fi
 	# монтирование проверяем раз за загрузку, а не перед каждой командой
 	[[ -f $DIR/mounted ]] || ensure_mount
+	[[ ${GROW:-0} != 1 ]] || grow_guest
 }
 
 # ---------- команды ----------
@@ -933,6 +978,11 @@ cmd_share() { # [имя] [DIR[:ro]|off]
 		conf_set SHARE_RO "$PSHARE_RO"
 		info "$NAME: $PSHARE -> ~/$(basename "$PSHARE") в госте (/mnt/host)$([[ $PSHARE_RO == 1 ]] && echo ', только чтение')"
 	fi
+	if offer_restart && is_running && [[ -n $SHARE ]]; then info "в госте: ~/$(basename "$SHARE") (= /mnt/host)"; fi
+	return 0
+}
+
+offer_restart() { # применить изменения vm.conf к запущенной VM; 1 — отложено
 	is_running || return 0
 	if [[ -t 0 ]]; then
 		local a
@@ -940,11 +990,255 @@ cmd_share() { # [имя] [DIR[:ro]|off]
 		if [[ $a != [nNнН]* ]]; then
 			vm_stop && vm_start && { wait_ssh 180 || warn "ssh пока не отвечает"; }
 			ensure_mount
-			[[ -z $SHARE ]] || info "в госте: ~/$(basename "$SHARE") (= /mnt/host)"
 			return 0
 		fi
 	fi
 	warn "применится после перезапуска: lsw restart $NAME"
+	return 1
+}
+
+# ---------- ресурсы: lsw set ----------
+
+disk_bytes() { # размер диска гостя (не файла: в JSON первым идёт узел file с длиной файла)
+	local b
+	b=$(qemu-img info -U "$DIR/disk.qcow2" | sed -n 's/^virtual size:.*(\([0-9]*\) bytes).*/\1/p')
+	[[ $b =~ ^[0-9]+$ ]] && echo "$b"
+}
+
+human() { numfmt --to=iec-i --suffix=B "$1"; }
+
+grow_guest() { # расширить последний раздел и ФС гостя до размера диска
+	ssh_opts
+	local cmd
+	if [[ $TYPE == linux ]]; then # те же модули cloud-init, что расширяют диск при первой загрузке
+		cmd='sudo cloud-init single --name growpart --frequency always && sudo cloud-init single --name resizefs --frequency always'
+	else
+		cmd='Update-HostStorageCache; $m = (Get-PartitionSupportedSize -DriveLetter C).SizeMax; if ($m -gt (Get-Partition -DriveLetter C).Size + 1MB) { Resize-Partition -DriveLetter C -Size $m -ErrorAction Stop }'
+	fi
+	if "${SSH[@]}" "$VMUSER@127.0.0.1" "$cmd" </dev/null >/dev/null 2>&1; then
+		conf_set GROW 0
+		info "$NAME: раздел гостя расширен до размера диска"
+	else
+		warn "не удалось расширить раздел в госте — попробую при следующем входе"
+	fi
+}
+
+grow_disk() { # 40G | +10G
+	local spec=${1^^} cur new err
+	[[ $spec =~ ^\+?[1-9][0-9]*[MGT]$ ]] || die "--disk: размер вида 40G или +10G"
+	cur=$(disk_bytes) || die "не прочитал размер диска"
+	if [[ $spec == +* ]]; then new=$((cur + $(numfmt --from=iec "${spec#+}"))); else new=$(numfmt --from=iec "$spec"); fi
+	((new > cur)) || die "диск можно только увеличить (сейчас $(human "$cur"))"
+	((new > 0 && cur > 0)) || die "не прочитал размер диска"
+	if is_running; then
+		err=$(qmp_ok "{\"execute\":\"block_resize\",\"arguments\":{\"device\":\"d0\",\"size\":$new}}") ||
+			die "QEMU не изменил размер диска: $err"
+	else
+		qemu-img resize -q "$DIR/disk.qcow2" "$new" || die "qemu-img resize не удался"
+	fi
+	conf_set GROW 1
+	info "$NAME: диск $(human "$cur") → $(human "$new")"
+	if is_running && ssh_ready; then grow_guest; fi
+}
+
+cmd_set() { # [имя] [--cpus N] [--mem 4G] [--disk 40G|+10G]
+	local name='' cpus='' mem='' disk='' restart=0
+	if (($#)) && [[ $1 != -* ]]; then name=$1; shift; fi
+	load_vm "$(resolve_name "$name")"
+	if ! (($#)); then
+		printf '%s: %s CPU, %s RAM, диск %s (файл %s)\n' "$NAME" "$CPUS" "$MEM" \
+			"$(human "$(disk_bytes)")" "$(du -h "$DIR/disk.qcow2" | cut -f1)"
+		return
+	fi
+	while (($#)); do
+		case $1 in
+		--cpus) cpus=${2:?--cpus N}; shift ;;
+		--mem) mem=${2:?--mem 4G}; shift ;;
+		--disk) disk=${2:?--disk 40G}; shift ;;
+		*) die "lsw set [имя] [--cpus N] [--mem 4G] [--disk 40G|+10G]" ;;
+		esac
+		shift
+	done
+	if [[ -n $cpus ]]; then
+		[[ $cpus =~ ^[1-9][0-9]*$ ]] || die "--cpus: число"
+		((cpus <= $(nproc))) || warn "у хоста всего $(nproc) потоков"
+		[[ $cpus == "$CPUS" ]] || { conf_set CPUS "$cpus"; restart=1; }
+	fi
+	if [[ -n $mem ]]; then
+		mem=${mem^^}
+		[[ $mem =~ ^[1-9][0-9]*[MG]$ ]] || die "--mem: размер вида 4G или 4096M"
+		(($(mem_mb "$mem") >= 512)) || die "--mem: минимум 512M"
+		(($(mem_mb "$mem") * 1024 < $(awk '/^MemTotal/ {print $2}' /proc/meminfo))) || warn "это больше всей памяти хоста"
+		[[ $mem == "$MEM" ]] || { conf_set MEM "$mem"; restart=1; }
+	fi
+	[[ -z $disk ]] || grow_disk "$disk"
+	if ((restart)); then
+		info "$NAME: $CPUS CPU, $MEM RAM"
+		offer_restart || true
+	fi
+}
+
+# ---------- проброс портов: lsw port ----------
+# FWDS в vm.conf — через пробел: proto:адрес:порт_хоста:порт_гостя (tcp:127.0.0.1:8080:80)
+
+net_fwds() { # -> ",hostfwd=...,hostfwd=..." для -netdev user
+	local f p a h g out=''
+	for f in ${FWDS:-}; do
+		IFS=: read -r p a h g <<<"$f"
+		out+=",hostfwd=$p:$a:$h-:$g"
+	done
+	echo "$out"
+}
+
+valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (($1 >= 1 && $1 <= 65535)); }
+
+parse_fwd() { # [АДРЕС:]ХОСТ[:ГОСТЬ][/udp] -> PFWD
+	local s=$1 proto=tcp addr=127.0.0.1 h g p
+	case $s in */udp) proto=udp s=${s%/udp} ;; */tcp) s=${s%/tcp} ;; esac
+	IFS=: read -ra p <<<"$s"
+	case ${#p[@]} in
+	1) h=${p[0]} g=${p[0]} ;;
+	2) h=${p[0]} g=${p[1]} ;;
+	3) addr=${p[0]} h=${p[1]} g=${p[2]} ;;
+	*) die "порт: 8080, 8080:80, 0.0.0.0:8080:80, 5353/udp" ;;
+	esac
+	[[ $addr == localhost ]] && addr=127.0.0.1
+	[[ $addr =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "адрес хоста: IPv4, например 127.0.0.1 или 0.0.0.0"
+	valid_port "$h" && valid_port "$g" || die "порт должен быть 1–65535: $1"
+	PFWD=$proto:$addr:$h:$g
+}
+
+cmd_port() { # [имя] [list | [add] SPEC | rm ХОСТ[/udp]]
+	local name='' op spec f p a h g
+	if (($#)) && [[ -f $(vm_dir "$1")/vm.conf ]]; then name=$1; shift; fi
+	load_vm "$(resolve_name "$name")"
+	FWDS=${FWDS:-}
+	op=${1:-list}
+	case $op in
+	list | ls)
+		printf '  %-22s → %-5s %s\n' "127.0.0.1:$PORT" 22 ssh
+		for f in $FWDS; do
+			IFS=: read -r p a h g <<<"$f"
+			printf '  %-22s → %-5s %s\n' "$a:$h" "$g" "$p"
+		done
+		;;
+	rm | del | remove)
+		spec=${2:?lsw port [имя] rm ПОРТ[/udp]}
+		p=tcp
+		[[ $spec == */udp ]] && p=udp
+		spec=${spec%/*}
+		spec=${spec##*:}
+		local keep='' hit=''
+		for f in $FWDS; do
+			if [[ $f == "$p":*:"$spec":* ]]; then hit=$f; else keep+=" $f"; fi
+		done
+		[[ -n $hit ]] || die "$NAME: порт $spec/$p не проброшен (lsw port $NAME)"
+		if is_running; then
+			IFS=: read -r p a h g <<<"$hit"
+			[[ $(qmp_hmp "hostfwd_remove n0 $p:$a:$h") == *removed* ]] || warn "QEMU не закрыл порт сразу — закроется после перезапуска"
+		fi
+		conf_set FWDS "${keep# }"
+		info "$NAME: порт $spec/$p закрыт"
+		;;
+	*)
+		[[ $op == add ]] && shift
+		parse_fwd "${1:?lsw port [имя] ПОРТ[:ПОРТ_ГОСТЯ]}"
+		IFS=: read -r p a h g <<<"$PFWD"
+		for f in $FWDS; do
+			[[ $f != "$p":*:"$h":* ]] || die "$NAME: порт $h/$p уже проброшен (lsw port $NAME rm $h)"
+		done
+		local owner
+		owner=$(vm_host_ports | awk -v h="$h" '$1 == h && o == "" {o = $2} END {print o}')
+		[[ -z $owner ]] || die "порт $h хоста уже занят VM '$owner'"
+		local low
+		low=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+		((h >= low)) || die "порты хоста ниже $low открывает только root — возьми, например, $((h + 8000)):$g"
+		if is_running; then
+			local err
+			err=$(qmp_hmp "hostfwd_add n0 $p:$a:$h-:$g") || die "QEMU не открыл порт $h: ${err:-занят?}"
+		elif ss -Hl"$([[ $p == udp ]] && echo u || echo t)"n "sport = :$h" 2>/dev/null | grep -q .; then
+			warn "порт $h на хосте сейчас занят — VM не запустится, пока его не освободят"
+		fi
+		conf_set FWDS "${FWDS:+$FWDS }$PFWD"
+		info "$NAME: $a:$h → гость:$g ($p)"
+		[[ $a != 0.0.0.0 ]] || warn "порт доступен всем в сети хоста, не только тебе"
+		[[ $TYPE != windows ]] || warn "в Windows открой порт и в брандмауэре: New-NetFirewallRule -DisplayName lsw-$h -Direction Inbound -Protocol ${p^^} -LocalPort $g -Action Allow"
+		;;
+	esac
+}
+
+# ---------- снимки: lsw snapshot ----------
+
+snap_tags() { qemu-img snapshot -l -U "$DIR/disk.qcow2" 2>/dev/null | awk 'NR > 2 {print $2}'; }
+
+snap_exists() { snap_tags | grep -qxF -- "$1"; }
+
+guest_sync() { # сбросить кеши гостя на диск перед снимком запущенной VM
+	ssh_ready || return 0
+	ssh_opts
+	if [[ $TYPE == linux ]]; then
+		timeout 60 "${SSH[@]}" "$VMUSER@127.0.0.1" sync </dev/null >/dev/null 2>&1 || true
+	else
+		timeout 60 "${SSH[@]}" "$VMUSER@127.0.0.1" 'Write-VolumeCache C' </dev/null >/dev/null 2>&1 || true
+	fi
+}
+
+cmd_snapshot() { # [имя] [list|save [метка]|restore <метка> [-f]|rm <метка>]
+	local name='' op tag err
+	if (($#)) && [[ -f $(vm_dir "$1")/vm.conf ]]; then name=$1; shift; fi
+	load_vm "$(resolve_name "$name")"
+	[[ $INSTALLED == 1 ]] || die "'$NAME' ещё устанавливается"
+	op=${1:-list} tag=${2:-}
+	case $op in
+	list | ls)
+		local out
+		out=$(qemu-img snapshot -l -U "$DIR/disk.qcow2" | awk 'NR > 2 {printf "  %-24s %s %s\n", $2, $5, substr($6, 1, 5)}')
+		if [[ -z $out ]]; then echo "$NAME: снимков нет (lsw snapshot $NAME save)"; return; fi
+		echo "$out"
+		echo "  файл диска: $(du -h "$DIR/disk.qcow2" | cut -f1) — снимки держат старые данные, удаляй ненужные"
+		;;
+	save | create | new)
+		tag=${tag:-$(date +%Y%m%d-%H%M%S)}
+		[[ $tag =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "метка: буквы, цифры, . _ -"
+		snap_exists "$tag" && die "снимок '$tag' уже есть"
+		if is_running; then
+			# диск без памяти: после restore гость загрузится как после выключения питания
+			guest_sync
+			err=$(qmp_ok "{\"execute\":\"blockdev-snapshot-internal-sync\",\"arguments\":{\"device\":\"d0\",\"name\":\"$tag\"}}") ||
+				die "QEMU не сделал снимок: $err"
+		else
+			qemu-img snapshot -c "$tag" "$DIR/disk.qcow2" || die "qemu-img не сделал снимок"
+		fi
+		info "$NAME: снимок '$tag' (вернуть: lsw snapshot $NAME restore $tag)"
+		;;
+	restore | revert | apply)
+		[[ -n $tag ]] || die "lsw snapshot $NAME restore <метка> (lsw snapshot $NAME)"
+		snap_exists "$tag" || die "нет снимка '$tag' (lsw snapshot $NAME)"
+		if [[ ${3:-} != -f ]]; then
+			[[ -t 0 ]] || die "текущее состояние диска $NAME будет потеряно — подтверди: -f"
+			local a
+			read -rp "Вернуть $NAME к '$tag'? Всё, что изменилось после снимка, пропадёт. [y/N] " a
+			[[ $a == [yYдД]* ]] || exit 1
+		fi
+		local was=0
+		if is_running; then was=1; vm_stop; fi
+		qemu-img snapshot -a "$tag" "$DIR/disk.qcow2" || die "qemu-img не применил снимок"
+		info "$NAME: возвращена к '$tag'"
+		if ((was)); then vm_start && { wait_ssh 180 || warn "ssh пока не отвечает"; }; fi
+		;;
+	rm | del | delete)
+		[[ -n $tag ]] || die "lsw snapshot $NAME rm <метка>"
+		snap_exists "$tag" || die "нет снимка '$tag'"
+		if is_running; then
+			err=$(qmp_ok "{\"execute\":\"blockdev-snapshot-delete-internal-sync\",\"arguments\":{\"device\":\"d0\",\"name\":\"$tag\"}}") ||
+				die "QEMU не удалил снимок: $err"
+		else
+			qemu-img snapshot -d "$tag" "$DIR/disk.qcow2" || die "qemu-img не удалил снимок"
+		fi
+		info "$NAME: снимок '$tag' удалён"
+		;;
+	*) die "lsw snapshot [имя] [list|save [метка]|restore <метка>|rm <метка>]" ;;
+	esac
 }
 
 cmd_rm() {
@@ -1052,6 +1346,9 @@ main() {
 	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
 	ssh-config) cmd_ssh_config "$@" ;;
 	share) cmd_share "$@" ;;
+	set) cmd_set "$@" ;;
+	port | ports) cmd_port "$@" ;;
+	snapshot | snap | snapshots) cmd_snapshot "$@" ;;
 	rm | remove) cmd_rm "$@" ;;
 	pull) pull_image "${1:?дистрибутив}" force >/dev/null ;;
 	deps) cmd_deps ;;
