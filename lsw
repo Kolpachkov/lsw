@@ -1014,7 +1014,8 @@ cmd_install() {
 			vm_start
 		fi
 		info "первая загрузка и cloud-init...$([[ $ARCH == arm64 ]] && echo ' (arm64 под эмуляцией: 5–15 минут)')"
-		wait_ssh 300 || die "гость не поднял ssh вовремя (lsw logs $name)"
+		wait_boot 300 || die "гость не поднял ssh за $([[ $ARCH == arm64 ]] && echo 20 || echo 5) мин. Последнее в консоли: $(console_line 200). Весь лог: lsw logs $name"
+		info "ssh есть, жду конца cloud-init (пользователь, ключи, размер диска)"
 		ssh_opts
 		"${SSH[@]}" "$VMUSER@127.0.0.1" 'cloud-init status --wait >/dev/null 2>&1 || true'
 	else
@@ -1033,6 +1034,30 @@ cmd_install() {
 	info "готово: lsw shell $name   (пользователь $VMUSER, пароль в $DIR/password)"
 }
 
+console_line() { # [ширина] -> последняя осмысленная строка серийной консоли гостя
+	# OSC/DCS (запросы терминала от systemd: ESC P…ESC \\, ESC ]…BEL), CSI, прочие ESC-пары
+	tail -c 4096 "$DIR/console.log" 2>/dev/null | tr '\r' '\n' |
+		sed -E 's/\x1b[]P_^][^\x07\x1b]*(\x07|\x1b\\)?//g; s/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b.//g; s/[[:cntrl:]]//g' |
+		grep -E '[[:alnum:]]' | tail -1 | cut -c1-"${1:-60}" || true
+}
+
+wait_boot() { # таймаут — как wait_ssh, но с ходом загрузки: время и что гость пишет в консоль
+	local t=$1 t0=$SECONDS deadline cols
+	[[ ${ARCH:-amd64} == arm64 ]] && t=$((t * 4))
+	deadline=$((SECONDS + t))
+	cols=$(( $(tput cols 2>/dev/null || echo 80) - 12 ))
+	until ssh_ready; do
+		is_running || { printf '\r\e[K' >&2; die "VM '$NAME' остановилась. Последнее в консоли: $(console_line 200) (lsw logs $NAME)"; }
+		if ((SECONDS >= deadline)); then
+			printf '\r\e[K' >&2
+			return 1
+		fi
+		printf '\r\e[K  %d:%02d  %s' $(((SECONDS - t0) / 60)) $(((SECONDS - t0) % 60)) "$(console_line "$cols")" >&2
+		sleep 2
+	done
+	printf '\r\e[K' >&2
+}
+
 # установщик сам выключает VM (shutdown: poweroff); показываем прогресс по серийной консоли
 install_from_iso() {
 	info "автоустановка Ubuntu Server, обычно 5–15 минут (Ctrl+C — прервать и удалить VM)"
@@ -1040,8 +1065,7 @@ install_from_iso() {
 	local t0=$SECONDS cols line
 	cols=$(( $(tput cols 2>/dev/null || echo 80) - 22 ))
 	while is_running; do
-		line=$(tail -c 4096 "$DIR/console.log" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr '\r' '\n' |
-			grep -E '[[:alnum:]]' | tail -1 | cut -c1-"$cols" || true)
+		line=$(console_line "$cols")
 		printf '\r\e[K  %3d мин  %s' $(((SECONDS - t0) / 60)) "$line" >&2
 		(((SECONDS - t0) < 3600)) || { echo >&2; qmp quit; die "установка идёт больше часа — смотри $DIR/console.log"; }
 		sleep 3
