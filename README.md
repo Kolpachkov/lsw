@@ -56,7 +56,7 @@ lsw stop --all
 lsw tui        # или просто lsw, если VM по умолчанию ещё нет
 ```
 ```
- lsw 0.7.2 · 3 VM, запущено 1
+ lsw 0.7.3 · 3 VM, запущено 1
  ○   armbox       ubuntu/arm64   │ dev  (по умолчанию)
  ● * dev          ubuntu         │ ● запущена · 1:02:13 · 812 MiB на хосте
  ○   win          windows        │ Система  ubuntu · linux · amd64
