@@ -6,6 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
+ISO_DIR=${LSW_ISO_DIR:-$HOME/ISO} # своя папка для ISO: lsw ищет образы здесь в первую очередь
 LSW_VERSION=0.9.1
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
@@ -21,7 +22,7 @@ lsw — лёгкие терминальные виртуалки (любой Lin
   lsw install <дистрибутив> [имя] [опции]   облачный образ, ставится сам:
       ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch
       almalinux almalinux-9 rocky rocky-9 centos-stream opensuse alt
-  lsw install файл.iso [имя] [опции]  ISO — что это, lsw смотрит сам:
+  lsw install файл.iso [имя] [опции]  ISO — что это, lsw смотрит сам (имя без пути — из ~/ISO):
       Ubuntu Server и Windows ставятся сами; любой другой Linux — вручную:
       установщик открывается в терминале (серийная консоль) или по VNC, потом
       lsw входит по паролю, кладёт ssh-ключ и дальше VM как все
@@ -61,8 +62,8 @@ lsw — лёгкие терминальные виртуалки (любой Lin
   lsw code [имя] [папка]    VS Code в госте через Remote-SSH (как code . в WSL); из общей папки — та же папка
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
-  lsw images                скачанные облачные образы и найденные ISO (кеш, ~/Downloads, $LSW_ISO_DIRS)
-  lsw images rm <образ>     удалить образ из кеша (ubuntu-24.04, ubuntu-arm64, файл.iso)
+  lsw images                скачанные облачные образы и ISO (~/ISO, кеш, ~/Downloads, $LSW_ISO_DIRS)
+  lsw images rm <образ>     удалить образ из кеша или ~/ISO (ubuntu-24.04, ubuntu-arm64, файл.iso)
   lsw pull <дистрибутив> [--arch arm64]  скачать / обновить облачный образ
   lsw deps                  проверить зависимости
   lsw version               версия и путь к скрипту
@@ -408,13 +409,30 @@ CLOUD_IMAGES=( # дистрибутив арх подпись
 	"debian arm64 Debian 13 arm64"
 )
 
-iso_dirs() { # где искать ISO: кеш, «Загрузки», LSW_ISO_DIRS (через :)
+iso_dirs() { # где искать ISO: папка ISO, кеш, «Загрузки», LSW_ISO_DIRS (через :)
 	local dl
+	echo "$ISO_DIR"
 	echo "$CACHE"
 	dl=$(xdg-user-dir DOWNLOAD 2>/dev/null) || dl=''
 	[[ -n $dl && $dl != "$HOME" ]] || dl=$HOME/Downloads
 	echo "$dl"
 	[[ -z ${LSW_ISO_DIRS:-} ]] || tr ':' '\n' <<<"$LSW_ISO_DIRS"
+}
+
+iso_find() { # путь или имя ISO -> полный путь; имя без пути ищется и в папках ISO
+	local d
+	if [[ -f $1 ]]; then realpath "$1"; return; fi
+	[[ $1 == */* ]] && return 1
+	while IFS= read -r d; do
+		[[ -n $d && -f $d/$1 ]] && { realpath "$d/$1"; return; }
+	done < <(iso_dirs)
+	return 1
+}
+
+iso_own() { # файл в папке ISO или в кеше lsw — такие lsw может удалять
+	local d
+	d=$(realpath "$(dirname "$1")")
+	[[ $d == "$(realpath -m "$CACHE")" || $d == "$(realpath -m "$ISO_DIR")" ]]
 }
 
 iso_kind() { # iso -> ubuntu | windows | desktop | arm | other | unknown — по имени файла, быстро
@@ -604,11 +622,15 @@ cmd_images() { # [list | rm <файл | дистрибутив[-arm64]>]
 		((hdr)) || printf '\nISO не найдены (ищу в: %s)\n' "$(iso_dirs | sed "s|^$HOME|~|" | paste -sd' ')"
 		;;
 	rm | remove)
-		[[ -n ${2:-} ]] || die "lsw images rm <файл в кеше | ubuntu-24.04 | ubuntu-arm64>"
+		[[ -n ${2:-} ]] || die "lsw images rm <файл.iso | ubuntu-24.04 | ubuntu-arm64>"
 		if [[ $2 == */* ]]; then f=$(realpath -m "$2")
-		else f=$CACHE/$2; [[ -f $f ]] || f=$CACHE/$2.img; fi
+		else
+			f=$CACHE/$2
+			[[ -f $f ]] || f=$CACHE/$2.img
+			[[ -f $f ]] || f=$ISO_DIR/$2
+		fi
 		[[ -f $f ]] || die "нет такого образа: $2 (lsw images)"
-		[[ $(realpath "$(dirname "$f")") == "$(realpath -m "$CACHE")" ]] || die "$f не в кеше lsw — удаляю только оттуда"
+		iso_own "$f" || die "${f/#"$HOME"/\~} не в ${ISO_DIR/#"$HOME"/\~} и не в кеше lsw — такие удаляй сам"
 		u=$(image_users "$f" | paste -sd' ')
 		[[ -z $u ]] || die "${f##*/} ещё нужен для установки: $u"
 		l=$(human "$(stat -c %s "$f")")
@@ -1183,8 +1205,8 @@ cmd_install() {
 	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64 manual=0
 	# lsw install файл.iso [имя] — что за система, смотрим по самому ISO
 	if [[ $distro == *.[iI][sS][oO] ]]; then
-		[[ -f $distro ]] || die "нет файла $distro"
-		iso=$(realpath "$distro") distro=auto
+		iso=$(iso_find "$distro") || die "нет файла $distro (ищу и в ${ISO_DIR/#"$HOME"/\~}; все ISO — lsw images)"
+		distro=auto
 	fi
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
@@ -1196,7 +1218,7 @@ cmd_install() {
 		--no-share) share='' ;;
 		--password) pass=$2; shift ;;
 		--user) user=$2; shift ;;
-		--iso) iso=$(realpath "$2"); shift ;;
+		--iso) iso=$(iso_find "$2") || die "нет файла $2 (ищу и в ${ISO_DIR/#"$HOME"/\~}; все ISO — lsw images)"; shift ;;
 		--key) key=$2; shift ;;
 		--edition) edition=$2; shift ;;
 		--lang) lang=$2; shift ;;
@@ -2693,11 +2715,18 @@ t_install() { # новая VM из образа: облачные (скачан�
 		T_PSEL=$PICK
 		if ((PICK == ${#K[@]})); then # свой путь к ISO
 			[[ $T_PKEY == enter ]] || continue
-			dl=$(iso_dirs | sed -n 2p)
+			dl=$(iso_dirs | sed -n 3p)
 			t_prompt "Путь к ISO (любой Linux или Windows 10): " "$dl/" || continue
 			p=$REPLY
 			[[ -f $p ]] || { t_msg 1 "нет файла $p"; continue; }
-			p=$(realpath "$p") k=$(iso_kind "$p")
+			p=$(realpath "$p")
+			if [[ $(dirname "$p") != "$(realpath -m "$ISO_DIR")" ]] &&
+				t_confirm "Перенести ${p##*/} в ${ISO_DIR/#"$HOME"/\~}, чтобы он был в списке?"; then
+				mkdir -p "$ISO_DIR"
+				if [[ -e $ISO_DIR/${p##*/} ]]; then t_msg 1 "в ${ISO_DIR/#"$HOME"/\~} уже есть ${p##*/}"; continue; fi
+				mv -n "$p" "$ISO_DIR/" && p=$(realpath "$ISO_DIR/${p##*/}")
+			fi
+			k=$(iso_kind "$p")
 			[[ $k == unknown ]] && k=$(iso_probe "$p")
 			case $k in
 			arm) t_msg 1 "${p##*/}: $(iso_label "$k" "$p")"; continue ;;
@@ -2731,10 +2760,10 @@ t_install() { # новая VM из образа: облачные (скачан�
 		d)
 			[[ -n $job ]] && { t_msg 1 "$l качается — подожди окончания"; continue; }
 			[[ -f $p ]] || { t_msg 1 "$l не скачан"; continue; }
-			if [[ $(realpath "$(dirname "$p")") != "$(realpath -m "$CACHE")" ]]; then
-				t_msg 1 "${p/#"$HOME"/\~} не в кеше lsw — удаляй сам"; continue
+			if ! iso_own "$p"; then
+				t_msg 1 "${p/#"$HOME"/\~} не в ${ISO_DIR/#"$HOME"/\~} и не в кеше lsw — удаляй сам"; continue
 			fi
-			t_confirm "Удалить ${p##*/} ($(human "$(stat -c %s "$p")")) из кеша?" && t_do images rm "$p"
+			t_confirm "Удалить ${p##*/} ($(human "$(stat -c %s "$p")"))?" && t_do images rm "$p"
 			continue
 			;;
 		esac
@@ -2837,7 +2866,7 @@ cmd_tui() {
 }
 
 main() {
-	mkdir -p "$VMS"
+	mkdir -p "$VMS" "$ISO_DIR"
 	local c=${1:-}
 	(($#)) && shift
 	case $c in

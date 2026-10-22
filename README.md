@@ -42,8 +42,8 @@ lsw upgrade --from lsw-offline-ubuntu-24.04.tar.gz   # без интернета
 ```sh
 lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init, изолирована
 lsw install arch              # также debian, fedora, almalinux, rocky, centos-stream, opensuse, alt
-lsw install windows --iso ~/Downloads/Win10_22H2_Russian_x64.iso   # 15–40 мин без участия
-lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso       # любой Linux с ISO — вручную, в терминале
+lsw install windows --iso Win10_22H2_Russian_x64.iso   # 15–40 мин без участия; имя без пути — из ~/ISO
+lsw install nixos-minimal-26.05-x86_64-linux.iso       # любой Linux с ISO — вручную, в терминале
 
 lsw                           # shell в VM по умолчанию
 lsw shell arch
@@ -79,9 +79,10 @@ lsw tui        # или просто lsw, если VM по умолчанию е
 `e` — CPU/память/диск, `p` — порты, `n` — снимки, `f` — общая папка, `v` — VS Code, `i` — новая VM, `d` — удалить, `?` — все клавиши.
 
 `i` открывает список образов: облачные (`✓` — уже скачан, `↓` — скачается при создании) и ISO, найденные
-в кеше lsw, `~/Downloads` и папках из `LSW_ISO_DIRS` (через `:`). Enter — создать VM из образа (спросит имя, общую папку и опции; ход установки виден справа, не выходя из интерфейса,
+в папке **`~/ISO`** (своя: `LSW_ISO_DIR`), кеше lsw, `~/Downloads` и папках из `LSW_ISO_DIRS` (через `:`). Enter — создать VM из образа (спросит имя, общую папку и опции; ход установки виден справа, не выходя из интерфейса,
 `d` на ставящейся VM — прервать и удалить),
-`u` — скачать или обновить облачный образ в фоне, `d` — удалить образ из кеша; последний пункт — ISO по пути.
+`u` — скачать или обновить облачный образ в фоне, `d` — удалить образ из кеша или `~/ISO`; последний пункт — ISO по пути
+(lsw предложит перенести его в `~/ISO`, чтобы в следующий раз он был в списке).
 ISO любого другого Linux ставится вручную: интерфейс уступает экран установщику (серийная консоль гостя),
 после установки возвращается сам; Enter на недоустановленной такой VM — продолжить установку.
 ```
@@ -193,7 +194,7 @@ lsw snapshot dev rm before-upgrade
 Для дистрибутивов без облачного образа (NixOS, Astra Linux, Gentoo, Void, свои сборки…) — их обычный ISO:
 
 ```sh
-lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso      # VM назовётся nixos
+lsw install nixos-minimal-26.05-x86_64-linux.iso      # из ~/ISO; VM назовётся nixos
 lsw install linux mybox --iso debian-13.1.0-amd64-netinst.iso --disk 40G
 ```
 
