@@ -2,7 +2,7 @@
 
 Аналог WSL для Linux: лёгкие headless-виртуалки на QEMU/KVM, управляемые одной bash-утилитой.
 Гости: **любой Linux** и **Windows 10**. Сами, без участия, ставятся Ubuntu, Debian, Fedora, Arch, AlmaLinux, Rocky,
-CentOS Stream и openSUSE (облачные образы), Ubuntu Server и Windows с ISO; любой другой дистрибутив — с его ISO,
+CentOS Stream, openSUSE и ALT Linux (облачные образы), Ubuntu Server и Windows с ISO; любой другой дистрибутив — с его ISO,
 установщик открывается прямо в терминале. Ubuntu и Debian есть и в arm64 под эмуляцией. Без GUI, вход через терминал (ssh).
 
 ## Установка
@@ -41,7 +41,7 @@ lsw upgrade --from lsw-offline-ubuntu-24.04.tar.gz   # без интернета
 
 ```sh
 lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init, изолирована
-lsw install arch              # также debian, fedora, almalinux, rocky, centos-stream, opensuse
+lsw install arch              # также debian, fedora, almalinux, rocky, centos-stream, opensuse, alt
 lsw install windows --iso ~/Downloads/Win10_22H2_Russian_x64.iso   # 15–40 мин без участия
 lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso       # любой Linux с ISO — вручную, в терминале
 
@@ -59,7 +59,7 @@ lsw stop --all
 lsw tui        # или просто lsw, если VM по умолчанию ещё нет
 ```
 ```
- lsw 0.9.0 · 3 VM, запущено 1
+ lsw 0.9.1 · 3 VM, запущено 1
  ○   armbox       ubuntu/arm64   │ dev  (по умолчанию)
  ● * dev          ubuntu         │ ● запущена · 1:02:13 · 812 MiB на хосте
  ○   win          windows        │ Система  ubuntu · linux · amd64
@@ -190,7 +190,7 @@ lsw snapshot dev rm before-upgrade
 
 ## Любой Linux с ISO
 
-Для дистрибутивов без облачного образа (NixOS, Gentoo, Void, Slackware, свои сборки…) — их обычный ISO:
+Для дистрибутивов без облачного образа (NixOS, Astra Linux, Gentoo, Void, свои сборки…) — их обычный ISO:
 
 ```sh
 lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso      # VM назовётся nixos
@@ -209,6 +209,12 @@ lsw install linux mybox --iso debian-13.1.0-amd64-netinst.iso --disk 40G
 4. **Первая загрузка.** lsw входит по ssh с паролем, кладёт свой ключ и настраивает sudo без пароля
    (`/etc/sudoers.d/90-lsw`), перезапускает VM без экрана — дальше это обычная VM: `lsw shell`, `--share`,
    порты, снимки. Если sshd в госте не поднялся, экран — по VNC, ход — в строке прогресса.
+
+**Российские дистрибутивы.** ALT Linux ставится сам из облачного образа: `lsw install alt` (p11; образ берётся
+с зеркала mirror.datacenter.by — официальный сервер отдаёт ~100 КБ/с, — и сверяется с SHA256 с ftp.altlinux.org;
+своё зеркало: `LSW_ALT_MIRROR=https://…/ALTLinux`). Astra Linux — только с ISO, вручную: публично доступен
+Common Edition «Орёл» (`dl.astralinux.ru/astra/stable/2.12_x86-64/iso/`), Special Edition — ваш лицензионный ISO.
+Установщик Astra — как у Debian, в выборе ПО отметь «Средства удалённого доступа SSH».
 
 Ubuntu Server ISO ставится сам, без участия — через `autoinstall` (`--manual` — поставить вручную, как любой):
 

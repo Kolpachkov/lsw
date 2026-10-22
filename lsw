@@ -6,7 +6,7 @@ LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.9.0
+LSW_VERSION=0.9.1
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
@@ -20,7 +20,7 @@ lsw — лёгкие терминальные виртуалки (любой Lin
 
   lsw install <дистрибутив> [имя] [опции]   облачный образ, ставится сам:
       ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch
-      almalinux almalinux-9 rocky rocky-9 centos-stream opensuse
+      almalinux almalinux-9 rocky rocky-9 centos-stream opensuse alt
   lsw install файл.iso [имя] [опции]  ISO — что это, lsw смотрит сам:
       Ubuntu Server и Windows ставятся сами; любой другой Linux — вручную:
       установщик открывается в терминале (серийная консоль) или по VNC, потом
@@ -314,12 +314,23 @@ distro_url() { # distro [amd64|arm64]
 	opensuse | opensuse-tumbleweed)
 		[[ $a == amd64 ]] || return 1
 		echo https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2 ;;
+	alt | alt-p11)
+		[[ $a == amd64 ]] || return 1
+		# ftp.altlinux.org отдаёт ~100 КБ/с — качаем с зеркала, сумму сверяем с официальной (distro_sums)
+		echo "${LSW_ALT_MIRROR:-https://mirror.datacenter.by/pub/ALTLinux}/images/p11/cloud/x86_64/alt-p11-cloud-x86_64.qcow2" ;;
+	*) return 1 ;;
+	esac
+}
+
+distro_sums() { # distro -> официальный файл SHA256 (если образ качается с зеркала)
+	case $1 in
+	alt | alt-p11) echo https://ftp.altlinux.org/pub/distributions/ALTLinux/images/p11/cloud/x86_64/SHA256SUM ;;
 	*) return 1 ;;
 	esac
 }
 
 # облачные образы с cloud-init: ставятся сами, как ubuntu и arch
-LINUX_DISTROS="ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch almalinux almalinux-9 rocky rocky-9 centos-stream opensuse"
+LINUX_DISTROS="ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch almalinux almalinux-9 rocky rocky-9 centos-stream opensuse alt"
 
 distro_known() { # distro [arch] -> есть ли облачный образ (без сети)
 	local d
@@ -336,6 +347,7 @@ distro_canon() { # синонимы -> имя файла в кеше и в vm.co
 	rocky-10) echo rocky ;;
 	centos-stream-10) echo centos-stream ;;
 	opensuse-tumbleweed) echo opensuse ;;
+	alt-p11) echo alt ;;
 	*) echo "$1" ;;
 	esac
 }
@@ -354,7 +366,19 @@ pull_image() { # distro [force] [arch]
 	if [[ ! -f $f || ${2:-} == force ]]; then
 		mkdir -p "$CACHE"
 		info "скачиваю $1: $url"
-		curl -fL --progress-bar -o "$f.part" "$url" || die "не удалось скачать образ"
+		# обрывы на медленных зеркалах: повторяем и докачиваем .part с места остановки
+		curl -fL --progress-bar --retry 10 --retry-delay 3 --retry-all-errors -C - -o "$f.part" "$url" ||
+			die "не удалось скачать образ (недокачанное — $f.part, повтор продолжит с места обрыва)"
+		local sums want got
+		if sums=$(distro_sums "$1"); then
+			want=$(curl -fsSL --max-time 30 --retry 5 --retry-delay 3 --retry-all-errors "$sums" |
+				awk -v n="${url##*/}" '$2 == n || $2 == "*" n {print $1; exit}') || true
+			# сеть — не повод выбрасывать скачанное: повтор возьмёт .part и проверит снова
+			[[ -n $want ]] || die "не удалось получить контрольную сумму с $sums — повтори позже, образ скачан ($f.part)"
+			got=$(sha256sum "$f.part" | cut -d' ' -f1)
+			[[ $got == "$want" ]] || { rm -f "$f.part"; die "контрольная сумма ${url##*/} не совпала с $sums — файл удалён"; }
+			info "контрольная сумма совпала с официальной"
+		fi
 		mv "$f.part" "$f"
 	fi
 	echo "$f"
@@ -378,6 +402,7 @@ CLOUD_IMAGES=( # дистрибутив арх подпись
 	"rocky-9 amd64 Rocky Linux 9"
 	"centos-stream amd64 CentOS Stream 10"
 	"opensuse amd64 openSUSE Tumbleweed"
+	"alt amd64 ALT Linux p11"
 	"ubuntu arm64 Ubuntu 26.04 arm64"
 	"ubuntu-24.04 arm64 Ubuntu 24.04 arm64"
 	"debian arm64 Debian 13 arm64"
@@ -401,6 +426,7 @@ iso_kind() { # iso -> ubuntu | windows | desktop | arm | other | unknown — п�
 	*ubuntu* | *live-server*) echo ubuntu ;;
 	win* | *windows*) echo windows ;;
 	nixos* | archlinux* | debian* | fedora* | *opensuse* | manjaro* | linuxmint* | alpine* | kali*) echo other ;;
+	astra* | alce* | orel* | smolensk* | alt-* | alt_* | altlinux* | redos* | rosa*) echo other ;;
 	*) echo unknown ;;
 	esac
 }
@@ -1423,6 +1449,8 @@ EOF
 	fedora* | almalinux* | rocky* | centos* | rhel* | oracle*) printf '  • Anaconda: у пользователя отметь «Сделать администратором»; sshd в серверной установке включён сам\n' >&2 ;;
 	arch*) printf '  • Arch: войди как root (без пароля), archinstall — добавь пакет openssh; в конце войди в chroot и выполни systemctl enable sshd\n' >&2 ;;
 	opensuse*) printf '  • openSUSE: на экране итогов включи «SSH service» и открой порт SSH\n' >&2 ;;
+	astra* | alce* | orel* | smolensk*) printf '  • Astra: установщик как у Debian — в выборе ПО отметь «Средства удалённого доступа SSH»; первый пользователь получит sudo\n' >&2 ;;
+	alt*) printf '  • ALT: в выборе ПО включи OpenSSH-сервер; после установки от root: usermod -aG wheel %s и control sudo wheelonly\n' "$VMUSER" >&2 ;;
 	ubuntu*) printf '  • Ubuntu: отметь «Install OpenSSH server» (в Desktop — после установки: sudo apt install openssh-server)\n' >&2 ;;
 	esac
 	printf '  • в конце выбери перезагрузку или выключение — lsw заметит это и продолжит сам\n\n' >&2
