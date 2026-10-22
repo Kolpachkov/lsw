@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# lsw — WSL-подобные headless-VM для Linux на QEMU/KVM (гости: Ubuntu, Arch, Windows 10; Ubuntu arm64 — эмуляция)
+# lsw — WSL-подобные headless-VM для Linux на QEMU/KVM (гости: любой Linux — облачные образы и ISO, Windows 10; arm64 — эмуляция)
 set -euo pipefail
 
 LSW_HOME=${LSW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/lsw}
 VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
-LSW_VERSION=0.8.0
+LSW_VERSION=0.9.0
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
@@ -16,15 +16,22 @@ warn() { printf '\e[1;33m!!\e[0m %s\n' "$*" >&2; }
 
 usage() {
 	cat <<'EOF'
-lsw — лёгкие терминальные виртуалки (Linux / Windows 10) на QEMU/KVM
+lsw — лёгкие терминальные виртуалки (любой Linux / Windows 10) на QEMU/KVM
 
-  lsw install <ubuntu|ubuntu-24.04|ubuntu-22.04|arch> [имя] [опции]
+  lsw install <дистрибутив> [имя] [опции]   облачный образ, ставится сам:
+      ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch
+      almalinux almalinux-9 rocky rocky-9 centos-stream opensuse
+  lsw install файл.iso [имя] [опции]  ISO — что это, lsw смотрит сам:
+      Ubuntu Server и Windows ставятся сами; любой другой Linux — вручную:
+      установщик открывается в терминале (серийная консоль) или по VNC, потом
+      lsw входит по паролю, кладёт ssh-ключ и дальше VM как все
   lsw install ubuntu  [имя] --iso ubuntu-XX.04-live-server-amd64.iso  (автоустановка с ISO)
+  lsw install linux   [имя] --iso любой.iso  (вручную; --manual — и для Ubuntu Server)
   lsw install windows [имя] --iso Win10.iso [опции]
       --cpus N        (linux 2, windows 4)
       --mem  4G       (linux 2G, windows 4G)
-      --disk 40G      (linux 20G, windows 64G)
-      --arch arm64    ARM-гость (только ubuntu*, без KVM — программная эмуляция, в разы медленнее)
+      --disk 40G      (linux 20G, с ISO 30G, windows 64G)
+      --arch arm64    ARM-гость (ubuntu*, debian*; без KVM — программная эмуляция, в разы медленнее)
       --share DIR[:ro]  открыть папку хоста в госте как /mnt/host (:ro — только чтение);
                         по умолчанию VM изолирована и ничего с хоста не видит
       --user NAME     пользователь в госте (по умолчанию — как на хосте; ivan@corp.ru -> ivan)
@@ -32,7 +39,7 @@ lsw — лёгкие терминальные виртуалки (Linux / Window
       --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
       --edition N     индекс редакции в install.wim/esd
       --lang ru-RU    язык ISO Windows (обычно определяется сам)
-      --vnc           включить VNC 127.0.0.1:59xx (посмотреть, что с установкой Windows)
+      --vnc           включить VNC 127.0.0.1:59xx (экран установки Windows; для ISO Linux — графический установщик)
 
   lsw tui                   интерфейс в терминале: все VM и действия над ними
   lsw                       shell в VM по умолчанию (если её нет — tui)
@@ -157,7 +164,7 @@ load_vm() {
 	NAME=$1
 	DIR=$(vm_dir "$NAME")
 	[[ -f $DIR/vm.conf ]] || die "VM '$NAME' не найдена (lsw list)"
-	ARCH=amd64 WINBUILD="" # VM до 0.5.0 — без ARCH в vm.conf; WINBUILD — узнаётся при первом lsw shell
+	ARCH=amd64 WINBUILD="" MANUAL=0 INSTALL_UI="" # VM до 0.5.0 — без ARCH в vm.conf; WINBUILD — узнаётся при первом lsw shell
 	# shellcheck disable=SC1091
 	source "$DIR/vm.conf"
 }
@@ -279,20 +286,71 @@ distro_url() { # distro [amd64|arm64]
 	ubuntu-24.04) echo "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-$a.img" ;;
 	ubuntu-22.04) echo "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-$a.img" ;;
 	arch) [[ $a == amd64 ]] || return 1; echo https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2 ;;
+	debian | debian-13 | debian-12)
+		local v=${1#debian-}
+		[[ $v == debian ]] && v=13
+		local code=trixie da=amd64
+		[[ $v == 12 ]] && code=bookworm
+		[[ $a == arm64 ]] && da=arm64
+		echo "https://cloud.debian.org/images/cloud/$code/latest/debian-$v-genericcloud-$da.qcow2" ;;
+	fedora)
+		[[ $a == amd64 ]] || return 1
+		local u
+		u=$(curl -fsSL --max-time 20 https://fedoraproject.org/releases.json 2>/dev/null |
+			grep -oE 'https://[^"]*/Fedora-Cloud-Base-Generic-[0-9]+-[0-9.]+\.x86_64\.qcow2' | sort -V | tail -1) || true
+		[[ -n $u ]] || { warn "не удалось узнать последнюю версию Fedora (fedoraproject.org/releases.json)"; return 1; }
+		echo "$u" ;;
+	almalinux | almalinux-10 | almalinux-9)
+		[[ $a == amd64 ]] || return 1
+		local v=${1#almalinux-}; [[ $v == almalinux ]] && v=10
+		echo "https://repo.almalinux.org/almalinux/$v/cloud/x86_64/images/AlmaLinux-$v-GenericCloud-latest.x86_64.qcow2" ;;
+	rocky | rocky-10 | rocky-9)
+		[[ $a == amd64 ]] || return 1
+		local v=${1#rocky-}; [[ $v == rocky ]] && v=10
+		echo "https://dl.rockylinux.org/pub/rocky/$v/images/x86_64/Rocky-$v-GenericCloud-Base.latest.x86_64.qcow2" ;;
+	centos-stream | centos-stream-10)
+		[[ $a == amd64 ]] || return 1
+		echo https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2 ;;
+	opensuse | opensuse-tumbleweed)
+		[[ $a == amd64 ]] || return 1
+		echo https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-Cloud.qcow2 ;;
 	*) return 1 ;;
 	esac
 }
 
+# облачные образы с cloud-init: ставятся сами, как ubuntu и arch
+LINUX_DISTROS="ubuntu ubuntu-24.04 ubuntu-22.04 debian debian-12 fedora arch almalinux almalinux-9 rocky rocky-9 centos-stream opensuse"
+
+distro_known() { # distro [arch] -> есть ли облачный образ (без сети)
+	local d
+	d=$(distro_canon "$1")
+	[[ " $LINUX_DISTROS " == *" $d "* ]] || return 1
+	[[ ${2:-amd64} == amd64 || $d == ubuntu* || $d == debian* ]]
+}
+
+distro_canon() { # синонимы -> имя файла в кеше и в vm.conf
+	case $1 in
+	ubuntu-26.04) echo ubuntu ;;
+	debian-13) echo debian ;;
+	almalinux-10) echo almalinux ;;
+	rocky-10) echo rocky ;;
+	centos-stream-10) echo centos-stream ;;
+	opensuse-tumbleweed) echo opensuse ;;
+	*) echo "$1" ;;
+	esac
+}
+
 image_file() { # distro [arch] -> путь образа в кеше (может ещё не существовать)
-	local d=$1
-	[[ $d == ubuntu-26.04 ]] && d=ubuntu
+	local d
+	d=$(distro_canon "$1")
 	if [[ ${2:-amd64} == amd64 ]]; then echo "$CACHE/$d.img"; else echo "$CACHE/$d-$2.img"; fi
 }
 
 pull_image() { # distro [force] [arch]
 	local url f a=${3:-amd64}
-	url=$(distro_url "$1" "$a") || die "неизвестный дистрибутив: $1 (ubuntu, ubuntu-24.04, ubuntu-22.04, arch, windows)"
 	f=$(image_file "$1" "$a")
+	[[ -f $f && ${2:-} != force ]] && { echo "$f"; return; }
+	url=$(distro_url "$1" "$a") || die "нет образа $1$([[ $a == arm64 ]] && echo ' для arm64'). Есть: ${LINUX_DISTROS// /, }; любой другой Linux — с ISO: lsw install linux --iso файл.iso"
 	if [[ ! -f $f || ${2:-} == force ]]; then
 		mkdir -p "$CACHE"
 		info "скачиваю $1: $url"
@@ -311,8 +369,18 @@ CLOUD_IMAGES=( # дистрибутив арх подпись
 	"ubuntu-24.04 amd64 Ubuntu 24.04"
 	"ubuntu-22.04 amd64 Ubuntu 22.04"
 	"arch amd64 Arch Linux"
+	"debian amd64 Debian 13"
+	"debian-12 amd64 Debian 12"
+	"fedora amd64 Fedora"
+	"almalinux amd64 AlmaLinux 10"
+	"almalinux-9 amd64 AlmaLinux 9"
+	"rocky amd64 Rocky Linux 10"
+	"rocky-9 amd64 Rocky Linux 9"
+	"centos-stream amd64 CentOS Stream 10"
+	"opensuse amd64 openSUSE Tumbleweed"
 	"ubuntu arm64 Ubuntu 26.04 arm64"
 	"ubuntu-24.04 arm64 Ubuntu 24.04 arm64"
+	"debian arm64 Debian 13 arm64"
 )
 
 iso_dirs() { # где искать ISO: кеш, «Загрузки», LSW_ISO_DIRS (через :)
@@ -324,7 +392,7 @@ iso_dirs() { # где искать ISO: кеш, «Загрузки», LSW_ISO_DI
 	[[ -z ${LSW_ISO_DIRS:-} ]] || tr ':' '\n' <<<"$LSW_ISO_DIRS"
 }
 
-iso_kind() { # iso -> ubuntu | windows | desktop | arm | unknown — по имени файла, быстро
+iso_kind() { # iso -> ubuntu | windows | desktop | arm | other | unknown — по имени файла, быстро
 	local f=${1##*/}
 	f=${f,,}
 	case $f in
@@ -332,19 +400,101 @@ iso_kind() { # iso -> ubuntu | windows | desktop | arm | unknown — по име
 	*desktop*) echo desktop ;;
 	*ubuntu* | *live-server*) echo ubuntu ;;
 	win* | *windows*) echo windows ;;
+	nixos* | archlinux* | debian* | fedora* | *opensuse* | manjaro* | linuxmint* | alpine* | kali*) echo other ;;
 	*) echo unknown ;;
 	esac
 }
 
-iso_probe() { # iso -> ubuntu | desktop | windows — заглянуть внутрь (для ISO с непонятным именем)
-	local tmp info
+iso_probe() { # iso -> ubuntu | desktop | windows | other — заглянуть внутрь (для ISO с непонятным именем)
+	local tmp info root
+	root=$(xorriso -indev "$1" -ls / 2>/dev/null | tr -d "'" || true)
+	if grep -qx '.disk' <<<"$root"; then
+		tmp=$(mktemp -d)
+		xorriso -osirrox on -indev "$1" -extract /.disk/info "$tmp/info" >/dev/null 2>&1 || true
+		info=$(cat "$tmp/info" 2>/dev/null || true)
+		rm -rf "$tmp"
+		if [[ $info != *buntu* ]]; then echo other # .disk/info есть и у Debian
+		elif [[ $info == *Server* ]]; then echo ubuntu
+		else echo desktop; fi
+	# Windows ISO — UDF: в ISO9660-части виден только README.TXT
+	elif [[ $root == README.TXT ]] || grep -qix 'sources' <<<"$root"; then echo windows
+	else echo other; fi
+}
+
+iso_volid() { xorriso -indev "$1" -pvd_info 2>/dev/null | sed -n 's/^Volume Id *: *//p' | head -1; }
+
+iso_slug() { # iso -> короткое имя дистрибутива (nixos, fedora, debian …) для имени VM и DISTRO
+	local v w1 w2
+	v=$(iso_volid "$1")
+	[[ -n $v ]] || v=${1##*/}
+	v=${v,,}
+	read -r w1 w2 _ <<<"${v//[^a-z0-9]/ }"
+	[[ $w1 == linux && -n $w2 ]] && w1=$w1$w2 # «Linux Mint …» -> linuxmint
+	w1=${w1%%[0-9]*}
+	[[ -n $w1 ]] || w1=linux
+	echo "${w1:0:20}"
+}
+
+# Ядро, initrd и строка загрузки из меню ISO (isolinux/syslinux, иначе GRUB): установщик грузим
+# напрямую (-kernel) с console=ttyS0 — тогда он работает в серийной консоли, прямо в терминале.
+# Выбираем текстовый пункт установки: без gui/graphic/rescue/memtest и т.п.
+iso_boot_entry() { # iso -> 3 строки: ядро, initrd, параметры; 1 — не нашли
+	local iso=$1 tmp list f args=() files rc=0
 	tmp=$(mktemp -d)
-	xorriso -osirrox on -indev "$1" -extract /.disk/info "$tmp/info" >/dev/null 2>&1 || true
-	info=$(cat "$tmp/info" 2>/dev/null || true)
+	list=$(xorriso -indev "$iso" -find / -type f -name '*.cfg' 2>/dev/null | tr -d "'" | grep -viE '/themes?/|/fonts?/|loopback\.cfg' | head -60) || true
+	for f in $list; do args+=(-extract "$f" "$tmp/$(echo "${f#/}" | tr / _)"); done
+	((${#args[@]})) && xorriso -osirrox on -indev "$iso" "${args[@]}" >/dev/null 2>&1 || true
+	files=$(xorriso -indev "$iso" -find / -type f 2>/dev/null | tr -d "'" | head -50000) || true
+	printf '%s\n' "$files" >"$tmp/.files"
+	awk '
+		FILENAME == F { have[$0] = 1; next }
+		function norm(x) { sub(/^\([^)]*\)/, "", x); gsub(/\/\/+/, "/", x); if (x != "" && x !~ /^\//) x = "/" x; return x }
+		function lastof(x) { sub(/.*,/, "", x); return x }
+		function score(l, k, a,   t, s) {
+			# пункты не для установки: по названию; сетевая загрузка — и по параметрам
+			if (tolower(l) ~ /memtest|hdt|reboot|poweroff|power off|shutdown|chain|pxe|nbd|nfs|http|hardware|hard ?disk|local|boot from|firmware|setup/) return -1
+			if (a ~ /_srv=|nfsroot=|ip=dhcp/) return -1
+			t = tolower(l " " k " " a)
+			s = 100
+			if (t ~ /gui|gtk|graphic|vesa|nomodeset|safe|rescue|recovery|copytoram|toram|speech|access|expert|automat|debug|failsafe|nvidia|check|verify|latest|dark|theme/) s -= 40
+			if (t ~ /install/) s += 10
+			return s
+		}
+		function flush(   sc) {
+			if (k != "" && k !~ /\.(c32|com|bin|efi|0)$/ && (k in have)) {
+				sc = score(l, k, ap)
+				if (sc >= 0 && lbl == dflt && dflt != "") sc += 5
+				if (sc >= 0 && ap ~ /\$/) sc -= 20 # переменные GRUB (${…}) без GRUB не подставить
+				if (sc > best) { best = sc; bk = k; bi = i; ba = ap }
+			}
+			k = ""; i = ""; ap = ""; l = ""; lbl = ""
+		}
+		BEGIN { best = -1 }
+		FNR == 1 { flush() }
+		tolower($1) == "default" { dflt = $2 }
+		tolower($1) == "label" { flush(); lbl = $2; l = $0 }
+		$1 == "menuentry" { flush(); l = $0 }
+		tolower($1) ~ /^(linux|kernel|linuxefi|linux16)$/ {
+			if (k != "" && l == "") flush()
+			k = norm($2); $1 = ""; $2 = ""
+			if (FILENAME ~ /grub/) ap = $0
+		}
+		tolower($1) ~ /^(initrd|initrdefi|initrd16)$/ { i = norm(lastof($NF)) }
+		tolower($1) == "append" { $1 = ""; ap = $0 }
+		END {
+			flush()
+			if (best < 0) exit 1
+			n = split(ap = ba, w, /[ \t]+/); out = ""
+			for (j = 1; j <= n; j++) {
+				if (w[j] == "") continue
+				if (w[j] ~ /^initrd=/) { if (bi == "") bi = norm(lastof(substr(w[j], 8))); continue }
+				if (w[j] ~ /^(quiet|splash|vga=.*|console=.*|loglevel=.*|BOOT_IMAGE=.*)$/ || w[j] ~ /\$/) continue
+				out = out (out == "" ? "" : " ") w[j]
+			}
+			print bk; print bi; print out
+		}' F="$tmp/.files" "$tmp/.files" "$tmp"/* 2>/dev/null || rc=1
 	rm -rf "$tmp"
-	if [[ -z $info ]]; then echo windows
-	elif [[ $info == *Server* ]]; then echo ubuntu
-	else echo desktop; fi
+	return $rc
 }
 
 iso_label() { # вид iso -> подпись
@@ -358,8 +508,11 @@ iso_label() { # вид iso -> подпись
 		if [[ $v == 11 ]] || grep -qiE 'win(dows)?[ _.-]?11' <<<"$f"; then echo "Windows 11"
 		elif win_old "$v"; then echo "Windows 10 $v — старая, кривой терминал"
 		else echo "Windows 10${v:+ $v}"; fi ;;
-	desktop) echo "Ubuntu Desktop (нужен Server)" ;;
+	desktop) echo "Ubuntu Desktop — вручную, VNC" ;;
 	arm) echo "ISO arm64 — не поддерживается" ;;
+	other)
+		v=$(iso_volid "$2")
+		echo "${v:-${f%.*}} — вручную" ;;
 	*) echo ISO ;;
 	esac
 }
@@ -379,7 +532,8 @@ image_scan() { # строки "вид|дистрибутив|арх|путь|п�
 			[[ -z ${seen[$r]:-} ]] || continue
 			seen[$r]=1
 			k=$(iso_kind "$r")
-			echo "$k|$([[ $k == windows ]] && echo windows || echo ubuntu)|amd64|$r|$(iso_label "$k" "$r")"
+			case $k in windows | ubuntu) d=$k ;; *) d=linux ;; esac
+			echo "$k|$d|amd64|$r|$(iso_label "$k" "$r")"
 		done
 	done < <(iso_dirs)
 }
@@ -398,7 +552,7 @@ image_users() { # файл -> имена VM, которым он ещё нуже
 
 cmd_pull() { # дистрибутив [--arch arm64]
 	local d=${1:-} a=amd64
-	[[ -n $d ]] || die "lsw pull <ubuntu|ubuntu-24.04|ubuntu-22.04|arch> [--arch arm64]"
+	[[ -n $d ]] || die "lsw pull <${LINUX_DISTROS// /|}> [--arch arm64]"
 	if [[ ${2:-} == --arch ]]; then
 		case ${3:-} in amd64 | x86_64) ;; arm64 | aarch64) a=arm64 ;; *) die "--arch: amd64 или arm64" ;; esac
 	fi
@@ -418,7 +572,7 @@ cmd_images() { # [list | rm <файл | дистрибутив[-arm64]>]
 				continue
 			fi
 			((hdr++)) || printf '\n\e[1mISO\e[0m  %s\n' "$(iso_dirs | sed "s|^$HOME|~|" | paste -sd' ')"
-			case $k in desktop | arm) f='\e[31m✗\e[0m' ;; *) f='\e[36m◉\e[0m' ;; esac
+			case $k in arm) f='\e[31m✗\e[0m' ;; *) f='\e[36m◉\e[0m' ;; esac
 			printf "  $f %s %s %s\n" "$(t_pad "$l" 30)" "$(t_pad "$(image_meta "$p")" 22)" "${p/#"$HOME"/\~}"
 		done < <(image_scan)
 		((hdr)) || printf '\nISO не найдены (ищу в: %s)\n' "$(iso_dirs | sed "s|^$HOME|~|" | paste -sd' ')"
@@ -522,7 +676,7 @@ ubuntu_iso_info() { # iso -> версия (24.04), только для Server IS
 	xorriso -osirrox on -indev "$1" -extract /.disk/info "$tmp/info" >/dev/null 2>&1 || true
 	info=$(cat "$tmp/info" 2>/dev/null || true)
 	rm -rf "$tmp"
-	[[ -n $info ]] || die "$1 не похож на ISO Ubuntu (нет .disk/info)"
+	[[ -n $info ]] || die "$1: это не ISO Ubuntu Server — $(iso_label "$(iso_probe "$1")" "$1")"
 	[[ $info == *Server* ]] || die "это не Server ISO ($info). Desktop ISO нельзя поставить без экрана — нужен *-live-server-amd64.iso"
 	ver=$(grep -oE '[0-9]{2}\.[0-9]{2}' <<<"$info" | head -1)
 	echo "${ver:-iso}"
@@ -572,6 +726,12 @@ disk_cache() {
 	fi
 }
 
+# ядро установщика грузится напрямую (-kernel): тогда bootindex=0 занят QEMU и диску его не даём
+linux_kernel_boot() {
+	[[ -n ${ISO:-} && $INSTALLED != 1 ]] || return 1
+	[[ ${MANUAL:-0} != 1 || $INSTALL_UI == serial ]]
+}
+
 linux_args() {
 	# arm64 (TCG): pauth-impdef — быстрая эмуляция pointer authentication
 	[[ $ARCH == arm64 ]] && ARGS+=(-cpu "${LSW_ARM_CPU:-max,pauth-impdef=on}") || ARGS+=(-cpu host)
@@ -579,14 +739,28 @@ linux_args() {
 		# отдельный iothread: ввод-вывод диска не стоит в очереди за vCPU и эмуляцией устройств
 		-object iothread,id=io0
 		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap"
-		-device virtio-blk-pci,drive=d0,iothread=io0,bootindex=0
-		-drive "file=$DIR/seed.iso,if=virtio,format=raw,readonly=on"
+		-device "virtio-blk-pci,drive=d0,iothread=io0$(linux_kernel_boot || echo ,bootindex=0)"
 		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22$(net_fwds)"
 		-device virtio-net-pci,netdev=n0
 		-device virtio-balloon-pci,free-page-reporting=on
-		-device virtio-rng-pci
-		-vga none)
-	if [[ -n ${ISO:-} && $INSTALLED != 1 ]]; then # установщик Ubuntu Server
+		-device virtio-rng-pci)
+	# seed cloud-init — для установленной системы; живой системе установщика (Arch ISO и др. тоже
+	# запускают cloud-init) он не нужен: переименует её и заведёт пользователя посреди установки
+	[[ ${MANUAL:-0} == 1 && -n ${ISO:-} && $INSTALLED != 1 ]] ||
+		ARGS+=(-drive "file=$DIR/seed.iso,if=virtio,format=raw,readonly=on")
+	# видеокарта на amd64 нужна всегда: без неё GRUB облачного Debian уходит в перезагрузки;
+	# экран виден только по VNC (ручная установка), иначе всё идёт в серийную консоль
+	if [[ $ARCH == arm64 ]]; then ARGS+=(-vga none); else ARGS+=(-vga std); fi
+	[[ -z ${VNC:-} ]] || ARGS+=(-device qemu-xhci -device usb-tablet)
+	if [[ -n ${ISO:-} && $INSTALLED != 1 && ${MANUAL:-0} == 1 ]]; then # любой ISO: установщик вручную
+		ARGS+=(-drive "file=$ISO,if=none,id=cd0,media=cdrom,readonly=on" -no-reboot)
+		if [[ $INSTALL_UI == serial ]]; then # ядро установщика напрямую, CD — только как источник пакетов
+			ARGS+=(-device ide-cd,drive=cd0,bus=ide.1
+				-kernel "$DIR/boot/vmlinuz" -initrd "$DIR/boot/initrd" -append "$(<"$DIR/boot/cmdline")")
+		else # загрузка с CD через его меню: пустой диск пропускается, дальше — CD
+			ARGS+=(-device ide-cd,drive=cd0,bus=ide.1,bootindex=1)
+		fi
+	elif [[ -n ${ISO:-} && $INSTALLED != 1 ]]; then # установщик Ubuntu Server
 		ARGS+=(-cdrom "$ISO" -kernel "$DIR/boot/vmlinuz" -initrd "$DIR/boot/initrd"
 			-append "autoinstall ds=nocloud console=ttyS0,115200" -no-reboot)
 	elif [[ -n $SHARE ]]; then
@@ -642,7 +816,10 @@ win_old() { [[ $1 =~ ^1[5-8]0[0-9]$ && $1 != 1809 ]]; }
 WIN_OLD_MSG="в Windows до 1809 нет ConPTY — терминал по ssh будет с артефактами (пустые экраны, ширина 80 колонок). Лучше ISO Windows 10 22H2: https://www.microsoft.com/software-download/windows10ISO"
 
 win_check_iso() {
-	local z
+	local z k
+	k=$(iso_kind "$1")
+	[[ $k == unknown ]] && k=$(iso_probe "$1")
+	[[ $k == windows ]] || die "$1: это не ISO Windows — $(iso_label "$k" "$1")"
 	if z=$(find_7z); then
 		local list
 		list=$("$z" l -ba "$1" 2>&1 || true)
@@ -931,8 +1108,9 @@ ensure_mount() {
 	"${SSH[@]}" "$VMUSER@127.0.0.1" "link=$(printf %q "$link")"'
 if ! mountpoint -q /mnt/host; then
 	sudo mkdir -p /mnt/host
-	grep -q " /mnt/host " /etc/fstab || echo "host /mnt/host virtiofs defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
-	sudo mount /mnt/host || exit 1
+	# в NixOS /etc/fstab только для чтения — тогда монтируем напрямую, на каждой загрузке
+	grep -q " /mnt/host " /etc/fstab || echo "host /mnt/host virtiofs defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null 2>&1
+	sudo mount /mnt/host 2>/dev/null || sudo mount -t virtiofs host /mnt/host || exit 1
 fi
 for l in ~/* ~/.[!.]*; do
 	[ -L "$l" ] && [ "$(readlink "$l")" = /mnt/host ] && [ "$l" != ~/"$link" ] && rm -f "$l"
@@ -943,7 +1121,10 @@ exit 0' </dev/null >/dev/null 2>&1 && : >"$DIR/mounted" ||
 }
 
 ensure_up() { # запустить при необходимости и дождаться ssh
-	[[ $INSTALLED == 1 ]] || die "'$NAME' ещё устанавливается (lsw list, lsw logs $NAME)"
+	if [[ $INSTALLED != 1 ]]; then
+		[[ ${MANUAL:-0} == 1 ]] && die "'$NAME' ещё не установлена — продолжить установку: lsw start $NAME"
+		die "'$NAME' ещё устанавливается (lsw list, lsw logs $NAME)"
+	fi
 	if ! is_running; then vm_start; fi
 	if ! ssh_ready; then
 		printf '\e[2m... жду %s\e[0m\n' "$NAME" >&2
@@ -971,9 +1152,14 @@ guest_user() { # имя -> допустимое имя пользователя 
 
 cmd_install() {
 	local distro=${1:-}
-	[[ -n $distro ]] || die "lsw install <ubuntu|ubuntu-24.04|arch|windows> [имя]"
+	[[ -n $distro ]] || die "lsw install <дистрибутив|файл.iso|windows> [имя] (дистрибутивы: ${LINUX_DISTROS// /, })"
 	shift
-	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64 manual=0
+	# lsw install файл.iso [имя] — что за система, смотрим по самому ISO
+	if [[ $distro == *.[iI][sS][oO] ]]; then
+		[[ -f $distro ]] || die "нет файла $distro"
+		iso=$(realpath "$distro") distro=auto
+	fi
 	if [[ ${1:-} && $1 != -* ]]; then name=$1; shift; fi
 	while (($#)); do
 		case $1 in
@@ -992,6 +1178,7 @@ cmd_install() {
 			case $2 in amd64 | x86_64) arch=amd64 ;; arm64 | aarch64) arch=arm64 ;; *) die "--arch: amd64 или arm64" ;; esac
 			shift ;;
 		--vnc) vnc=1 ;;
+		--manual) manual=1 ;;
 		*) die "неизвестная опция: $1" ;;
 		esac
 		shift
@@ -1002,12 +1189,31 @@ cmd_install() {
 	ensure_key
 	[[ $arch == arm64 ]] || kvm_check
 	if [[ $arch == arm64 ]]; then
-		[[ $distro == ubuntu* && -z $iso ]] || die "--arch arm64 поддерживается только для ubuntu из cloud-образа (без --iso)"
+		[[ -z $iso ]] && distro_known "$distro" arm64 || die "--arch arm64 есть только для ubuntu* и debian* из облачного образа (без --iso)"
 		find_aarch64 >/dev/null || die "для arm64 нужны qemu-system-aarch64 и UEFI: sudo pacman -S qemu-system-aarch64 edk2-aarch64 / sudo apt install qemu-system-arm qemu-efi-aarch64"
 	fi
 
-	local type=linux
-	if [[ $distro == windows ]]; then
+	local type=linux k=""
+	if [[ -n $iso && ( $distro == auto || $distro == linux ) ]]; then
+		[[ -f $iso ]] || die "нет файла $iso"
+		k=$(iso_kind "$iso")
+		[[ $k == unknown ]] && k=$(iso_probe "$iso")
+		case $k in
+		windows) [[ $distro == auto ]] || die "${iso##*/} — ISO Windows: lsw install windows --iso ${iso##*/}"
+			distro=windows ;;
+		arm) die "${iso##*/}: ISO для arm64 не поддерживается" ;;
+		ubuntu) ((manual)) || distro=ubuntu ;;
+		*) manual=1 ;;
+		esac
+		[[ $k == desktop ]] && vnc=1 # графический live-установщик: в консоли его не видно
+		((manual)) && distro=linux
+	elif [[ $distro == linux ]]; then
+		die "для любого Linux нужен ISO: lsw install linux [имя] --iso файл.iso"
+	fi
+	if ((manual)); then
+		[[ -n $iso && -f $iso ]] || die "--manual нужен вместе с --iso"
+		[[ $arch == amd64 ]] || die "ISO ставятся только как amd64"
+	elif [[ $distro == windows ]]; then
 		type=windows
 		[[ -n $iso && -f $iso ]] || die "для Windows нужен --iso путь/к/Win10.iso"
 		win_check_iso "$iso"
@@ -1015,9 +1221,10 @@ cmd_install() {
 		wv=$(win_release "$iso")
 		! win_old "$wv" || warn "ISO — Windows 10 $wv: $WIN_OLD_MSG"
 	else
-		distro_url "$distro" >/dev/null || die "неизвестный дистрибутив: $distro"
+		distro_known "$distro" "$arch" || die "нет облачного образа '$distro'. Есть: ${LINUX_DISTROS// /, }. Любой другой Linux — с ISO: lsw install linux --iso файл.iso"
+		distro=$(distro_canon "$distro")
 		if [[ -n $iso ]]; then
-			[[ $distro == ubuntu* ]] || die "--iso для Linux поддерживается только для Ubuntu Server"
+			[[ $distro == ubuntu* ]] || die "--iso $distro: для ISO любого дистрибутива — lsw install linux --iso файл.iso"
 			[[ -f $iso ]] || die "нет файла $iso"
 			local ver
 			ver=$(ubuntu_iso_info "$iso")
@@ -1025,11 +1232,23 @@ cmd_install() {
 			name=${name:-ubuntu-${ver//./}}
 		fi
 	fi
+	local slug=''
+	if ((manual)); then
+		slug=$(iso_slug "$iso")
+		[[ $k == desktop ]] && slug=ubuntu-desktop
+		if [[ -z $name ]]; then
+			local i=2
+			name=$slug
+			while [[ -e $(vm_dir "$name") ]]; do name=$slug-$i; ((i++)); done
+		fi
+	fi
 	name=${name:-$distro}
 	[[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "имя: только a-z, 0-9 и '-'"
 	[[ ! -e $(vm_dir "$name") ]] || die "VM '$name' уже есть"
 	if [[ $type == windows ]]; then
 		: "${cpus:=4}" "${mem:=4G}" "${disk:=64G}"
+	elif ((manual)); then
+		: "${cpus:=2}" "${mem:=2G}" "${disk:=30G}"
 	else
 		: "${cpus:=2}" "${mem:=2G}" "${disk:=20G}"
 	fi
@@ -1042,8 +1261,16 @@ cmd_install() {
 	# порт резервируем сразу: параллельная установка (tui) не должна взять тот же
 	{ flock 9; PORT=$(free_port); echo "$PORT" >"$DIR/port.reserve"; } 9>"$LSW_HOME/port.lock"
 	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem VMUSER=$user SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
+	MANUAL=$manual INSTALL_UI=''
 
-	if [[ $type == linux && -n $iso ]]; then
+	if ((manual)); then
+		DISTRO=$slug
+		INSTALL_UI=vnc
+		if [[ -z $vnc ]] && manual_prepare_kernel "$iso"; then INSTALL_UI=serial; fi
+		info "ISO ${iso##*/}: установка вручную, $([[ $INSTALL_UI == serial ]] && echo 'в консоли терминала' || echo 'экран по VNC'), диск $disk"
+		qemu-img create -q -f qcow2 -o preallocation=metadata "$DIR/disk.qcow2" "$disk"
+		make_seed
+	elif [[ $type == linux && -n $iso ]]; then
 		info "Ubuntu Server ISO ($distro), диск $disk"
 		extract_kernel "$iso"
 		qemu-img create -q -f qcow2 -o preallocation=metadata "$DIR/disk.qcow2" "$disk"
@@ -1064,12 +1291,16 @@ cmd_install() {
 
 	local v
 	{
-		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED; do printf '%s=%q\n' "$v" "${!v}"; done
+		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED MANUAL INSTALL_UI; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
 	rm -f "$DIR/port.reserve"
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
 
 	[[ -n $vnc ]] && VNC=$((PORT - 2222 + 10))
+	if ((manual)); then
+		manual_install # снимет trap, когда установщик запустится
+		return
+	fi
 	vm_start
 	trap - EXIT
 	[[ -n $vnc ]] && info "VNC: 127.0.0.1:$((5900 + VNC))"
@@ -1153,6 +1384,180 @@ install_from_iso() {
 	rm -rf "$DIR/boot"
 	make_seed
 	info "установка завершена, загружаю систему"
+}
+
+# ---------- любой Linux с ISO: установка вручную ----------
+
+manual_prepare_kernel() { # iso -> $DIR/boot/{vmlinuz,initrd,cmdline}; 1 — меню загрузки не разобрали
+	local e k i c
+	e=$(iso_boot_entry "$1") || return 1
+	{ read -r k; read -r i; read -r c; } <<<"$e"
+	[[ -n $k && -n $i ]] || return 1
+	mkdir -p "$DIR/boot"
+	xorriso -osirrox on -indev "$1" -extract "$k" "$DIR/boot/vmlinuz" -extract "$i" "$DIR/boot/initrd" >/dev/null 2>&1 &&
+		[[ -s $DIR/boot/vmlinuz && -s $DIR/boot/initrd ]] || { rm -rf "$DIR/boot"; return 1; }
+	chmod u+w "$DIR/boot"/*
+	# последний console= — основной: туда пишет установщик и там же ждёт ввода
+	printf '%s\n' "${c:+$c }console=tty0 console=ttyS0,115200" >"$DIR/boot/cmdline"
+}
+
+manual_hints() { # что сделать в установщике, чтобы lsw потом смог войти
+	local pass
+	pass=$(<"$DIR/password")
+	printf '\n\e[1mЧто сделать в установщике:\e[0m\n' >&2
+	printf '  • создай пользователя \e[1m%s\e[0m с паролем \e[1m%s\e[0m и правами sudo (администратор)\n' "$VMUSER" "$pass" >&2
+	printf '  • включи SSH-сервер (openssh) — по нему lsw войдёт после установки\n' >&2
+	printf '  • загрузчик — на диск /dev/vda (режим BIOS, не UEFI)\n' >&2
+	case $DISTRO in
+	nixos) cat >&2 <<EOF
+  • NixOS: разметка и nixos-generate-config --root /mnt, затем в /mnt/etc/nixos/configuration.nix:
+      boot.loader.grub.device = "/dev/vda";
+      boot.kernelParams = [ "console=ttyS0,115200" ];   # lsw console после установки
+      services.openssh.enable = true;
+      users.users.$VMUSER = { isNormalUser = true; extraGroups = [ "wheel" ]; initialPassword = "$pass"; };
+      security.sudo.wheelNeedsPassword = false;
+    и nixos-install, poweroff. Справка: https://nixos.org/manual/nixos/stable/#sec-installation-manual
+EOF
+		;;
+	debian*) printf '  • Debian: в «Выбор программного обеспечения» отметь «SSH server»; пароль root оставь пустым — тогда у пользователя будет sudo\n' >&2 ;;
+	fedora* | almalinux* | rocky* | centos* | rhel* | oracle*) printf '  • Anaconda: у пользователя отметь «Сделать администратором»; sshd в серверной установке включён сам\n' >&2 ;;
+	arch*) printf '  • Arch: войди как root (без пароля), archinstall — добавь пакет openssh; в конце войди в chroot и выполни systemctl enable sshd\n' >&2 ;;
+	opensuse*) printf '  • openSUSE: на экране итогов включи «SSH service» и открой порт SSH\n' >&2 ;;
+	ubuntu*) printf '  • Ubuntu: отметь «Install OpenSSH server» (в Desktop — после установки: sudo apt install openssh-server)\n' >&2 ;;
+	esac
+	printf '  • в конце выбери перезагрузку или выключение — lsw заметит это и продолжит сам\n\n' >&2
+}
+
+manual_disk_used() { qemu-img info -U --output=json "$DIR/disk.qcow2" 2>/dev/null | grep -o '"actual-size": *[0-9]*' | head -1 | grep -o '[0-9]*$' || echo 0; }
+
+vnc_open() { # открыть VNC-клиент, если он есть и есть графическая сессия
+	local p=$((5900 + VNC))
+	[[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] || return 0
+	if command -v vncviewer >/dev/null; then setsid vncviewer "127.0.0.1::$p" >/dev/null 2>&1 &
+	elif command -v gvncviewer >/dev/null; then setsid gvncviewer "127.0.0.1:$VNC" >/dev/null 2>&1 &
+	elif command -v remmina >/dev/null; then setsid remmina -c "vnc://127.0.0.1:$p" >/dev/null 2>&1 &
+	else return 0; fi
+	info "открываю VNC-клиент"
+}
+
+# фаза 1 — установщик с ISO (в серийной консоли или по VNC), фаза 2 — первая загрузка с диска и ssh
+manual_install() {
+	if [[ -n ${ISO:-} ]] && ! is_running && (($(manual_disk_used) >= 300 * 1024 * 1024)); then
+		# установщик уже отработал (VM выключилась без нас) — или его прервали на середине
+		local a=y
+		if [[ -t 0 ]]; then read -rp "На диске $NAME уже $(human "$(manual_disk_used)"). Система установлена? [Y/n] " a; fi
+		if [[ $a != [nNнН]* ]]; then conf_set ISO ''; ISO=''; rm -rf "$DIR/boot"; fi
+	fi
+	if [[ -n ${ISO:-} ]]; then
+		[[ -f $ISO ]] || die "нет файла $ISO — верни его на место или удали VM: lsw rm $NAME"
+		[[ $INSTALL_UI == vnc ]] && VNC=${VNC:-$((PORT - 2222 + 10))}
+		is_running || vm_start
+		trap - EXIT
+		manual_hints
+		if [[ $INSTALL_UI == serial && -t 0 && -t 1 ]]; then
+			info "консоль установщика $NAME — отключиться, не останавливая установку: Ctrl+]"
+			sleep 1
+			socat STDIO,rawer,escape=0x1d "UNIX-CONNECT:$DIR/console.sock" || true
+			printf '\r\n' >&2
+			if is_running; then
+				info "установщик работает в фоне. Вернуться: lsw console $NAME; когда он выключит VM: lsw start $NAME"
+				return 0
+			fi
+		else
+			if [[ $INSTALL_UI == vnc ]]; then
+				info "экран установщика: VNC 127.0.0.1:$((5900 + VNC)) — подключись любым VNC-клиентом (vncviewer, Remmina)"
+				vnc_open
+			else
+				info "консоль установщика: lsw console $NAME"
+			fi
+			info "жду, пока установщик выключит VM (Ctrl+C — оставить работать в фоне)"
+			trap 'printf "\n" >&2; info "установка идёт в фоне; когда VM выключится — lsw start $NAME"; exit 0' INT
+			local t0=$SECONDS
+			while is_running; do
+				printf '\r\e[K  %d мин  диск: %s' $(((SECONDS - t0) / 60)) "$(human "$(manual_disk_used)")" >&2
+				sleep 3
+			done
+			printf '\r\e[K' >&2
+			trap - INT
+		fi
+		rm -f "$DIR/qemu.pid"
+		local used
+		used=$(manual_disk_used)
+		((used >= 300 * 1024 * 1024)) ||
+			die "VM выключилась, а на диске всего $(human "$used") — система не установлена. Снова запустить установщик: lsw start $NAME"
+		conf_set ISO ''
+		ISO=''
+		rm -rf "$DIR/boot"
+		info "установка закончена — первая загрузка с диска"
+	fi
+	manual_firstboot
+}
+
+manual_firstboot() {
+	VNC=${VNC:-$((PORT - 2222 + 10))} # экран нужен, если sshd в госте не поднялся — войти и включить
+	if ! is_running; then vm_start; fi
+	info "жду, пока гость пустит $VMUSER по ssh с паролем — lsw положит свой ключ (Ctrl+C — прервать, VM останется)"
+	info "экран гостя: VNC 127.0.0.1:$((5900 + VNC))"
+	trap 'printf "\n" >&2; info "VM работает; закончить настройку: lsw start $NAME"; exit 0' INT
+	local t0=$SECONDS out='' why cols
+	cols=$(($(tput cols 2>/dev/null || echo 80) - 12))
+	until [[ $out == *LSW_OK* ]]; do
+		is_running || { printf '\r\e[K' >&2; die "VM выключилась до настройки ssh. Запустить снова: lsw start $NAME"; }
+		out=$(manual_bootstrap 2>&1) || true
+		[[ $out == *LSW_OK* ]] && break
+		case $out in
+		*'Permission denied'*) why="ssh: неверный пароль или нет пользователя $VMUSER (пароль: $(<"$DIR/password"))" ;;
+		*refused* | *'closed by'* | *reset* | *'timed out'* | *'banner exchange'* | '') why="ssh в госте пока не отвечает — система грузится, или sshd не включён" ;;
+		*) why=$(tr -d '\r' <<<"$out" | grep -v '^Warning:' | tail -1) ;;
+		esac
+		printf '\r\e[K  %d:%02d  %s' $(((SECONDS - t0) / 60)) $(((SECONDS - t0) % 60)) "${why:0:cols}" >&2
+		sleep 5
+	done
+	trap - INT
+	printf '\r\e[K' >&2
+	local l
+	while IFS= read -r l; do warn "${l#LSW_WARN: }"; done < <(grep '^LSW_WARN' <<<"$out" || true)
+	ssh_ready || die "ключ записан, но вход по ключу не работает — проверь PubkeyAuthentication в sshd гостя"
+	conf_set INSTALLED 1
+	if [[ ${VNC:-} ]]; then # дальше без экрана, как все VM
+		info "перезапускаю $NAME без экрана"
+		vm_stop
+		VNC=''
+		vm_start
+		wait_ssh 300 || die "после перезапуска ssh не поднялся (lsw start $NAME)"
+	fi
+	ensure_mount
+	ssh_config_sync
+	info "готово: lsw shell $NAME   (пользователь $VMUSER, пароль в $DIR/password)"
+}
+
+manual_bootstrap() { # вход по паролю: ключ lsw в authorized_keys, sudo без пароля; печатает LSW_OK
+	local ask=$DIR/askpass
+	printf '#!/bin/sh\ncat %q\n' "$DIR/password" >"$ask"
+	chmod 700 "$ask"
+	{
+		printf 'KEY=%q\nPASS=%q\nU=%q\n' "$(<"$KEY.pub")" "$(<"$DIR/password")" "$VMUSER"
+		cat <<'EOS'
+umask 077
+mkdir -p "$HOME/.ssh" || exit 1
+grep -qxF "$KEY" "$HOME/.ssh/authorized_keys" 2>/dev/null || printf '%s\n' "$KEY" >>"$HOME/.ssh/authorized_keys" || exit 1
+chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"
+command -v restorecon >/dev/null 2>&1 && restorecon -R "$HOME/.ssh" 2>/dev/null
+if ! sudo -n true 2>/dev/null; then
+	if printf '%s\n' "$PASS" | sudo -S -p '' true 2>/dev/null; then
+		printf '%s\n' "$PASS" | sudo -S -p '' sh -c "mkdir -p /etc/sudoers.d && echo '$U ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/90-lsw && chmod 440 /etc/sudoers.d/90-lsw" 2>/dev/null
+		sudo -n true 2>/dev/null || echo "LSW_WARN: sudo в госте спрашивает пароль — общая папка не смонтируется сама (в NixOS: security.sudo.wheelNeedsPassword = false)"
+	else
+		echo "LSW_WARN: у $U нет sudo — общая папка и расширение диска работать не будут"
+	fi
+fi
+echo LSW_OK
+EOS
+	} | SSH_ASKPASS=$ask SSH_ASKPASS_REQUIRE=force ssh -F /dev/null -p "$PORT" \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=INFO -o ConnectTimeout=5 \
+		-o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password \
+		-o NumberOfPasswordPrompts=1 -o ControlMaster=no -o ControlPath=none \
+		"$VMUSER@127.0.0.1" sh -s
 }
 
 cmd_list() {
@@ -1372,6 +1777,11 @@ human() { numfmt --to=iec-i --suffix=B "$1"; }
 grow_guest() { # расширить последний раздел и ФС гостя до размера диска
 	ssh_opts
 	local cmd
+	if [[ ${MANUAL:-0} == 1 ]] && ! "${SSH[@]}" "$VMUSER@127.0.0.1" 'command -v cloud-init' </dev/null >/dev/null 2>&1; then
+		conf_set GROW 0
+		warn "$NAME: в госте нет cloud-init — расширь раздел и ФС сам (growpart, resize2fs / xfs_growfs / btrfs filesystem resize)"
+		return
+	fi
 	if [[ $TYPE == linux ]]; then # те же модули cloud-init, что расширяют диск при первой загрузке
 		cmd='sudo cloud-init single --name growpart --frequency always && sudo cloud-init single --name resizefs --frequency always'
 	else
@@ -2170,6 +2580,8 @@ t_img_new() { # вид дистрибутив арх путь — спросит
 		name=ubuntu-${name:-iso}; name=${name//./} ;;
 	windows) name=win; [[ $(iso_label windows "$p") == *11 ]] && name=win11
 		hint='--cpus 4 --mem 8G --disk 80G --share ~/Work' ;;
+	*) name=$(iso_slug "$p"); [[ $k == desktop ]] && name=ubuntu-desktop
+		hint='--cpus 2 --mem 4G --disk 30G --share ~/Work' ;;
 	esac
 	base=$name
 	while [[ -e $(vm_dir "$name") ]]; do name=$base-$i; ((i++)); done
@@ -2191,6 +2603,11 @@ t_img_new() { # вид дистрибутив арх путь — спросит
 	t_prompt "Опции, можно пусто ($hint): " || return
 	read -ra extra <<<"$REPLY"
 	for e in "${!extra[@]}"; do [[ ${extra[e]} == '~'* ]] && extra[e]=$HOME${extra[e]:1}; done
+	if [[ $d == linux ]]; then # установщик интерактивный: консоль гостя прямо в терминале
+		t_ext --pause "$SELF" "${args[@]}" "${extra[@]}"
+		T_CUR=$name
+		return
+	fi
 	t_install_job "$name" "$([[ $k == cloud ]] && echo "$d" || echo "$d iso")$([[ $a == arm64 ]] && echo /arm64)" "${args[@]}" "${extra[@]}"
 }
 
@@ -2237,7 +2654,7 @@ t_install() { # новая VM из образа: облачные (скачан�
 				elif [[ -f $p ]]; then m="✓ $(t_pad "$l" "$lw") $(image_meta "$p")"
 				else m="↓ $(t_pad "$l" "$lw") скачается при создании"; fi
 			else
-				case $k in desktop | arm) m='✗' ;; *) m='◉' ;; esac
+				case $k in arm) m='✗' ;; *) m='◉' ;; esac
 				m="$m $(t_pad "$l" "$lw") $(human "$(stat -c %s "$p")") · ${p##*/}"
 			fi
 			items+=("$m")
@@ -2249,15 +2666,16 @@ t_install() { # новая VM из образа: облачные (скачан�
 		if ((PICK == ${#K[@]})); then # свой путь к ISO
 			[[ $T_PKEY == enter ]] || continue
 			dl=$(iso_dirs | sed -n 2p)
-			t_prompt "Путь к ISO (Ubuntu Server или Windows 10): " "$dl/" || continue
+			t_prompt "Путь к ISO (любой Linux или Windows 10): " "$dl/" || continue
 			p=$REPLY
 			[[ -f $p ]] || { t_msg 1 "нет файла $p"; continue; }
 			p=$(realpath "$p") k=$(iso_kind "$p")
 			[[ $k == unknown ]] && k=$(iso_probe "$p")
 			case $k in
-			desktop | arm) t_msg 1 "${p##*/}: $(iso_label "$k" "$p")"; continue ;;
+			arm) t_msg 1 "${p##*/}: $(iso_label "$k" "$p")"; continue ;;
 			esac
-			t_img_new "$k" "$([[ $k == windows ]] && echo windows || echo ubuntu)" amd64 "$p"
+			case $k in windows | ubuntu) d=$k ;; *) d=linux ;; esac
+			t_img_new "$k" "$d" amd64 "$p"
 			return
 		fi
 		k=${K[PICK]} d=${Dd[PICK]} a=${A[PICK]} p=${P[PICK]} l=${L[PICK]}
@@ -2267,12 +2685,12 @@ t_install() { # новая VM из образа: облачные (скачан�
 			[[ -z $job ]] || { t_msg 3 "$l ещё качается — подожди"; continue; }
 			if [[ $k == unknown ]]; then
 				t_msg 3 "смотрю, что в ${p##*/}…"; t_draw
-				k=$(iso_probe "$p") d=ubuntu
-				[[ $k == windows ]] && d=windows
+				k=$(iso_probe "$p")
+				case $k in windows | ubuntu) d=$k ;; *) d=linux ;; esac
 				t_msg 2 "${p##*/}: $(iso_label "$k" "$p")"
 			fi
 			case $k in
-			desktop | arm) t_msg 1 "${p##*/}: $(iso_label "$k" "$p")"; continue ;;
+			arm) t_msg 1 "${p##*/}: $(iso_label "$k" "$p")"; continue ;;
 			esac
 			t_img_new "$k" "$d" "$a" "$p"
 			return
@@ -2364,10 +2782,12 @@ cmd_tui() {
 			fi
 			case $T_KEY in
 			enter)
-				if [[ $st == installing ]]; then t_ext "$SELF" logs "$n"
+				if [[ $(t_conf "$n" MANUAL) == 1 && $(t_conf "$n" INSTALLED) != 1 ]]; then t_ext --pause "$SELF" start "$n"
+				elif [[ $st == installing ]]; then t_ext "$SELF" logs "$n"
 				else t_ext "$SELF" shell "$n"; fi ;;
 			s)
-				if [[ $st == stopped ]]; then t_bg "$n" запуск start "$n"
+				if [[ $st == stopped && $(t_conf "$n" MANUAL) == 1 && $(t_conf "$n" INSTALLED) != 1 ]]; then t_ext --pause "$SELF" start "$n"
+				elif [[ $st == stopped ]]; then t_bg "$n" запуск start "$n"
 				else t_bg "$n" остановка stop "$n"; fi ;;
 			r) t_bg "$n" перезапуск restart "$n" ;;
 			e) t_resources "$n" ;;
@@ -2402,7 +2822,10 @@ main() {
 	list | ls) cmd_list ;;
 	shell | sh) cmd_shell "$@" ;;
 	run) cmd_run "$@" ;;
-	start) load_vm "${1:?имя}" && vm_start && { [[ $INSTALLED != 1 ]] || wait_ssh 180 || warn "ssh пока не отвечает"; } ;;
+	start)
+		load_vm "${1:?имя}"
+		if [[ $MANUAL == 1 && $INSTALLED != 1 ]]; then manual_install
+		else vm_start && { [[ $INSTALLED != 1 ]] || wait_ssh 180 || warn "ssh пока не отвечает"; }; fi ;;
 	stop)
 		if [[ ${1:-} == --all ]]; then
 			local d

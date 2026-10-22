@@ -1,7 +1,9 @@
 # lsw
 
 Аналог WSL для Linux: лёгкие headless-виртуалки на QEMU/KVM, управляемые одной bash-утилитой.
-Гости: **Ubuntu** (26.04 / 24.04), **Arch**, **Windows 10**, а также **Ubuntu arm64** под эмуляцией. Без GUI, вход через терминал (ssh).
+Гости: **любой Linux** и **Windows 10**. Сами, без участия, ставятся Ubuntu, Debian, Fedora, Arch, AlmaLinux, Rocky,
+CentOS Stream и openSUSE (облачные образы), Ubuntu Server и Windows с ISO; любой другой дистрибутив — с его ISO,
+установщик открывается прямо в терминале. Ubuntu и Debian есть и в arm64 под эмуляцией. Без GUI, вход через терминал (ssh).
 
 ## Установка
 
@@ -39,8 +41,9 @@ lsw upgrade --from lsw-offline-ubuntu-24.04.tar.gz   # без интернета
 
 ```sh
 lsw install ubuntu            # ~1 мин: cloud-образ + cloud-init, изолирована
-lsw install arch
+lsw install arch              # также debian, fedora, almalinux, rocky, centos-stream, opensuse
 lsw install windows --iso ~/Downloads/Win10_22H2_Russian_x64.iso   # 15–40 мин без участия
+lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso       # любой Linux с ISO — вручную, в терминале
 
 lsw                           # shell в VM по умолчанию
 lsw shell arch
@@ -56,7 +59,7 @@ lsw stop --all
 lsw tui        # или просто lsw, если VM по умолчанию ещё нет
 ```
 ```
- lsw 0.8.0 · 3 VM, запущено 1
+ lsw 0.9.0 · 3 VM, запущено 1
  ○   armbox       ubuntu/arm64   │ dev  (по умолчанию)
  ● * dev          ubuntu         │ ● запущена · 1:02:13 · 812 MiB на хосте
  ○   win          windows        │ Система  ubuntu · linux · amd64
@@ -79,6 +82,8 @@ lsw tui        # или просто lsw, если VM по умолчанию е
 в кеше lsw, `~/Downloads` и папках из `LSW_ISO_DIRS` (через `:`). Enter — создать VM из образа (спросит имя, общую папку и опции; ход установки виден справа, не выходя из интерфейса,
 `d` на ставящейся VM — прервать и удалить),
 `u` — скачать или обновить облачный образ в фоне, `d` — удалить образ из кеша; последний пункт — ISO по пути.
+ISO любого другого Linux ставится вручную: интерфейс уступает экран установщику (серийная консоль гостя),
+после установки возвращается сам; Enter на недоустановленной такой VM — продолжить установку.
 ```
  ┌──────────────────────────────────────────────────────────────────────┐
  │ Новая VM — выбери образ                                              │
@@ -86,7 +91,10 @@ lsw tui        # или просто lsw, если VM по умолчанию е
  │ ✓ Ubuntu 26.04          826MiB · 2026-10-14                          │
  │ ↓ Ubuntu 22.04          скачается при создании                       │
  │ ✓ Arch Linux            552MiB · 2026-10-14                          │
+ │ ↓ Debian 13             скачается при создании                       │
+ │ ↓ Fedora                скачается при создании                       │
  │ ◉ Ubuntu Server 22.04   2.0GiB · ubuntu-22.04.5-live-server-amd64.iso│
+ │ ◉ nixos-minimal-26.05-x86_64 — установка вручную  1.4GiB · nixos-…   │
  │ ◉ Windows 10            5.8GiB · Win10_22H2_English_x64.iso          │
  │ + ISO из другого места…                                              │
  └─ ↵ создать VM · u скачать/обновить · d удалить ──────────────────────┘
@@ -101,15 +109,15 @@ Esc или Ctrl+C отменяют. Выход из интерфейса VM не
 ```sh
 ./install.sh --arm64                     # или: sudo pacman -S qemu-system-aarch64 edk2-aarch64
                                          #      sudo apt install qemu-system-arm qemu-efi-aarch64
-lsw install ubuntu armbox --arch arm64   # также ubuntu-24.04 / ubuntu-22.04
+lsw install ubuntu armbox --arch arm64   # также ubuntu-24.04 / ubuntu-22.04 / debian / debian-12
 lsw run armbox -- uname -m                # aarch64
 ```
 
-Настоящая ARM-машина (`virt`, UEFI, своё ядро и systemd) на официальном arm64 cloud-образе Ubuntu.
+Настоящая ARM-машина (`virt`, UEFI, своё ядро и systemd) на официальном arm64 cloud-образе Ubuntu или Debian.
 KVM для ARM на x86 не бывает, поэтому это **программная эмуляция** (многопоточный TCG):
 в 5–10 раз медленнее нативной VM, первая загрузка с cloud-init — 5–15 минут. Для терминала, сборки
 и тестов под arm64 хватает; общие папки (`--share`) работают так же, через virtiofs.
-Только Ubuntu: у Arch Linux ARM нет cloud-образа, Windows on ARM не поддерживается.
+Только Ubuntu и Debian: у остальных нет подходящего arm64 cloud-образа, Windows on ARM не поддерживается.
 Если нужно лишь запускать arm64-бинарники или собирать образы, легче `qemu-user-static` + binfmt
 (`docker run --platform linux/arm64 …`).
 
@@ -117,7 +125,7 @@ KVM для ARM на x86 не бывает, поэтому это **програ�
 
 | | Linux | Windows 10 |
 |---|---|---|
-| Установка | официальный cloud-образ → копия qcow2 → cloud-init (пользователь, ключ, hostname) | ISO + собственный `autounattend.xml` на втором CD, BIOS, разметка MBR |
+| Установка | официальный cloud-образ → копия qcow2 → cloud-init (пользователь, ключ, hostname); любой ISO — установщик вручную, потом вход по паролю и ключ | ISO + собственный `autounattend.xml` на втором CD, BIOS, разметка MBR |
 | Вход | ssh, ключ `~/.local/share/lsw/id_ed25519` | Win32-OpenSSH, по умолчанию PowerShell |
 | Диск / сеть | virtio-blk, virtio-net | AHCI, e1000e (драйверы встроены, virtio-win не нужен) |
 | Общая папка | по умолчанию нет; `--share DIR[:ro]` → `/mnt/host` через virtiofs | `\\10.0.2.4\qemu`, если на хосте стоит `samba` |
@@ -180,18 +188,37 @@ lsw snapshot dev rm before-upgrade
 только диск, без памяти: перед ним lsw делает `sync` в госте, а после restore гость загружается как после
 выключения питания. Снимки держат старые данные, поэтому файл диска растёт: ненужные лучше удалять.
 
-## Ubuntu с ISO
+## Любой Linux с ISO
 
-Обычно ISO не нужен: `lsw install ubuntu` ставит ту же Ubuntu Server из cloud-образа за минуту.
-Если нужен именно ISO (офлайн, точная версия), подходит только **Server** ISO:
+Для дистрибутивов без облачного образа (NixOS, Gentoo, Void, Slackware, свои сборки…) — их обычный ISO:
+
+```sh
+lsw install ~/Downloads/nixos-minimal-26.05-x86_64-linux.iso      # VM назовётся nixos
+lsw install linux mybox --iso debian-13.1.0-amd64-netinst.iso --disk 40G
+```
+
+1. **Установщик в терминале.** lsw читает меню загрузки ISO (isolinux/syslinux или GRUB), берёт текстовый пункт
+   установки и грузит его ядро с `console=ttyS0` — установщик работает в серийной консоли прямо в терминале,
+   как `lsw console`. Ctrl+] — отключиться (установка идёт дальше), вернуться — `lsw console <имя>` или
+   `lsw start <имя>`. Если меню не разобралось или установщик только графический (Ubuntu Desktop, Mint и т.п.)
+   — экран по **VNC** `127.0.0.1:59xx` (`--vnc`, чтобы выбрать это сразу); найденный vncviewer/Remmina откроется сам.
+2. **Что сделать в установщике** lsw печатает перед стартом: пользователь `$USER` с паролем из
+   `vms/<имя>/password` и sudo, включённый SSH-сервер, загрузчик на `/dev/vda` (BIOS). Для NixOS, Debian,
+   Fedora/RHEL, Arch, openSUSE — с подсказками, где это включается.
+3. **Конец установки** — перезагрузка или выключение: VM останавливается, lsw видит это и грузит систему с диска.
+4. **Первая загрузка.** lsw входит по ssh с паролем, кладёт свой ключ и настраивает sudo без пароля
+   (`/etc/sudoers.d/90-lsw`), перезапускает VM без экрана — дальше это обычная VM: `lsw shell`, `--share`,
+   порты, снимки. Если sshd в госте не поднялся, экран — по VNC, ход — в строке прогресса.
+
+Ubuntu Server ISO ставится сам, без участия — через `autoinstall` (`--manual` — поставить вручную, как любой):
 
 ```sh
 lsw install ubuntu --iso ubuntu-22.04.5-live-server-amd64.iso   # VM назовётся ubuntu-2204
 ```
 
 lsw достаёт из ISO ядро, грузит установщик с `autoinstall` и ответами через cloud-init seed,
-показывает прогресс по серийной консоли (5–15 мин). Установщику на это время даётся минимум 4 ГБ RAM.
-Итог — такая же VM, как из cloud-образа. Desktop ISO отклоняется: его установщик графический.
+показывает прогресс по серийной консоли (5–15 мин). Установщикам на это время даётся минимум 4 ГБ RAM.
+Итог — такая же VM, как из cloud-образа.
 
 ## Пользователь и пароль
 
