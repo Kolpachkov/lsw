@@ -7,7 +7,7 @@ VMS=$LSW_HOME/vms
 CACHE=$LSW_HOME/cache
 KEY=$LSW_HOME/id_ed25519
 ISO_DIR=${LSW_ISO_DIR:-$HOME/ISO} # своя папка для ISO: lsw ищет образы здесь в первую очередь
-LSW_VERSION=0.9.1
+LSW_VERSION=0.10.0
 LSW_REPO=${LSW_REPO:-Kolpachkov/lsw} # откуда lsw upgrade берёт релизы
 WIN_GENERIC_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T # публичный generic-ключ Win10 Pro: только установка, без активации
 
@@ -40,6 +40,7 @@ lsw — лёгкие терминальные виртуалки (любой Lin
       --key XXXXX-... ключ продукта Windows (по умолчанию generic Pro)
       --edition N     индекс редакции в install.wim/esd
       --lang ru-RU    язык ISO Windows (обычно определяется сам)
+      --no-virtio     Windows на SATA + e1000e, без драйверов virtio-win (медленнее)
       --vnc           включить VNC 127.0.0.1:59xx (экран установки Windows; для ISO Linux — графический установщик)
 
   lsw tui                   интерфейс в терминале: все VM и действия над ними
@@ -60,6 +61,8 @@ lsw — лёгкие терминальные виртуалки (любой Lin
   lsw snapshot [имя] [list|save [метка]|restore <метка> [-f]|rm <метка>]
                             снимки диска; save работает и на запущенной VM
   lsw code [имя] [папка]    VS Code в госте через Remote-SSH (как code . в WSL); из общей папки — та же папка
+  lsw gui [имя] программа [арг...]  окно Linux-программы гостя на рабочем столе хоста, как WSLg
+      (Wayland через waypipe, X11 через ssh -Y; --x11 / --wayland — только один способ)
   lsw ssh-config [имя]      блок для ~/.ssh/config (scp, rsync, VS Code)
   lsw rm <имя> [-f]         удалить VM
   lsw images                скачанные облачные образы и ISO (~/ISO, кеш, ~/Downloads, $LSW_ISO_DIRS)
@@ -137,6 +140,7 @@ cmd_deps() {
 	fi
 	[[ ${1:-} == quiet ]] && return
 	find_aarch64 >/dev/null || warn "для arm64-гостей нужны qemu-system-aarch64 и UEFI: sudo pacman -S qemu-system-aarch64 edk2-aarch64 / sudo apt install qemu-system-arm qemu-efi-aarch64"
+	command -v waypipe >/dev/null || warn "для lsw gui (окна программ гостя) лучше waypipe: sudo pacman -S waypipe / sudo apt install waypipe; без него — X11 через ssh"
 	find_7z >/dev/null || warn "для Windows желателен 7z (читает ISO Microsoft): sudo pacman -S 7zip / sudo apt install 7zip"
 	info "все зависимости на месте"
 }
@@ -165,7 +169,7 @@ load_vm() {
 	NAME=$1
 	DIR=$(vm_dir "$NAME")
 	[[ -f $DIR/vm.conf ]] || die "VM '$NAME' не найдена (lsw list)"
-	ARCH=amd64 WINBUILD="" MANUAL=0 INSTALL_UI="" # VM до 0.5.0 — без ARCH в vm.conf; WINBUILD — узнаётся при первом lsw shell
+	ARCH=amd64 WINBUILD="" MANUAL=0 INSTALL_UI="" WIN_VIRTIO=0 GUI_SETUP="" # VM до 0.5.0 — без ARCH в vm.conf; WINBUILD — узнаётся при первом lsw shell
 	# shellcheck disable=SC1091
 	source "$DIR/vm.conf"
 }
@@ -238,6 +242,8 @@ ssh_opts() {
 		-o LogLevel=ERROR -o BatchMode=yes -o ServerAliveInterval=30
 		# одно соединение на VM: повторные run/shell не делают новый ssh-handshake
 		-o ControlMaster=auto -o ControlPath="$DIR/ssh.sock" -o ControlPersist=10m)
+	# nomux — отдельное соединение (lsw gui: свой X11 и сокет waypipe); у ssh побеждает первое -o
+	[[ ${1:-} != nomux ]] || SSH=("${SSH[@]:0:${#SSH[@]}-6}" -o ControlPath=none)
 }
 
 ssh_close() { # закрыть фоновое мастер-соединение (перед остановкой/перезапуском VM)
@@ -682,7 +688,13 @@ runcmd:
   - grep -q ' /mnt/host ' /etc/fstab || echo 'host /mnt/host virtiofs defaults,nofail 0 0' >> /etc/fstab
   - mount /mnt/host || true
 EOF
+	# службы железного сервера, в VM лишние (~60-100 МБ RAM, ~1 с загрузки). snapd.socket остаётся:
+	# snap заработает по требованию. Нет службы в дистрибутиве — пропускается. Оставить всё: LSW_TRIM=0
+	if [[ ${LSW_TRIM:-1} != 0 ]]; then
+		echo "  - for s in $GUEST_TRIM; do systemctl disable --now \$s >/dev/null 2>&1; done; true"
+	fi
 }
+GUEST_TRIM='snapd.service snapd.seeded.service multipathd.service multipathd.socket ModemManager.service udisks2.service unattended-upgrades.service apport.service'
 
 write_seed() { # user-data-файл -> seed.iso (метка cidata)
 	local d=$DIR/seed
@@ -895,6 +907,42 @@ openssh_msi() {
 	[[ -f $f ]] && echo "$f" || true
 }
 
+# Драйверы virtio для Windows (диск viostor, сеть NetKVM) из virtio-win.iso. ISO большой (~850 МБ),
+# нужны из него несколько МБ: извлекаем w10 amd64 в $CACHE/virtio-win, скачанный ISO удаляем.
+# Без интернета: положи virtio-win*.iso в ~/ISO. Не удалось — Windows ставится на SATA + e1000e.
+VIRTIO_WIN_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+VIRTIO_WIN_DRV='viostor NetKVM'
+virtio_win_drivers() { # w10 -> каталог с драйверами (viostor/, NetKVM/) или код 1
+	local os=$1 out=$CACHE/virtio-win iso='' f drv
+	if [[ ! -f $out/$os.ok ]]; then
+		for f in "$ISO_DIR"/virtio-win*.iso; do [[ -f $f ]] && iso=$f; done
+		iso=${iso:-$CACHE/virtio-win.iso}
+		if [[ ! -f $iso ]]; then
+			info "скачиваю драйверы virtio-win (~850 МБ, один раз; из них останется несколько МБ)"
+			mkdir -p "$CACHE"
+			curl -fL --progress-bar --retry 10 --retry-delay 3 --retry-all-errors -C - -o "$iso.part" "$VIRTIO_WIN_URL" &&
+				mv "$iso.part" "$iso" || { warn "virtio-win не скачан ($VIRTIO_WIN_URL)"; return 1; }
+		fi
+		rm -rf "$out.tmp" && mkdir -p "$out.tmp"
+		for f in w10; do
+			mkdir -p "$out.tmp/$f" # сами: xorriso создал бы её с правами из ISO (только чтение) — второй драйвер не лёг бы
+			for drv in $VIRTIO_WIN_DRV; do
+				xorriso -osirrox on -indev "$iso" -extract "/$drv/$f/amd64" "$out.tmp/$f/$drv" >/dev/null 2>&1 || true
+			done
+			chmod -R u+w "$out.tmp/$f" 2>/dev/null
+			find "$out.tmp/$f" -name '*.pdb' -delete # отладочные символы — 3/4 объёма
+			local ok=1
+			for drv in $VIRTIO_WIN_DRV; do compgen -G "$out.tmp/$f/$drv/*.inf" >/dev/null || ok=0; done
+			((ok)) && touch "$out.tmp/$f.ok"
+		done
+		# скачанный ISO больше не нужен (свой из ~/ISO не трогаем); битый — оставляем, чтобы не качать снова
+		[[ $iso == "$CACHE/virtio-win.iso" && -f $out.tmp/$os.ok ]] && rm -f "$iso"
+		rm -rf "$out" && mv "$out.tmp" "$out"
+	fi
+	[[ -f $out/$os.ok ]] || { warn "в virtio-win нет драйверов для $os"; return 1; }
+	echo "$out/$os"
+}
+
 make_win_cfg() { # iso lang key edition
 	local d=$DIR/wincfg lang=$2 key=$3 edition=$4 pass msi input from=''
 	pass=$(<"$DIR/password")
@@ -907,10 +955,23 @@ make_win_cfg() { # iso lang key edition
 
 	local intl="<InputLocale>$input</InputLocale><SystemLocale>$lang</SystemLocale><UILanguage>$lang</UILanguage><UserLocale>$lang</UserLocale>"
 	local comp='processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"'
+	# драйверы virtio: установщику (WinPE) — чтобы увидел virtio-диск; буква CD с wincfg заранее не известна,
+	# несуществующие пути установщик пропускает. Сеть и диск в готовой системе — ещё и pnputil в lsw-setup.ps1
+	local pnp=''
+	if [[ ${WIN_VIRTIO:-0} == 1 ]]; then
+		cp -r "$VIRTIO_DIR" "$d/drivers"
+		local l i=0
+		for l in D E F G H; do
+			i=$((i + 1))
+			pnp+="<PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"$i\"><Path>$l:\\drivers</Path></PathAndCredentials>"
+		done
+		pnp="<component name=\"Microsoft-Windows-PnpCustomizationsWinPE\" $comp><DriverPaths>$pnp</DriverPaths></component>"
+	fi
 	cat >"$d/autounattend.xml" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
+    $pnp
     <component name="Microsoft-Windows-International-Core-WinPE" $comp>
       <SetupUILanguage><UILanguage>$lang</UILanguage></SetupUILanguage>
       $intl
@@ -948,7 +1009,7 @@ make_win_cfg() { # iso lang key edition
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Path>cmd /c "for %d in (D E F G H I J K) do if exist %d:\lsw-setup.ps1 (mkdir C:\lsw &amp; xcopy /y %d:\* C:\lsw\ &amp; mkdir C:\Windows\Setup\Scripts &amp; copy /y %d:\SetupComplete.cmd C:\Windows\Setup\Scripts\)"</Path>
+          <Path>cmd /c "for %d in (D E F G H I J K) do if exist %d:\lsw-setup.ps1 (mkdir C:\lsw &amp; xcopy /y /e /i %d:\* C:\lsw\ &amp; mkdir C:\Windows\Setup\Scripts &amp; copy /y %d:\SetupComplete.cmd C:\Windows\Setup\Scripts\)"</Path>
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
@@ -998,6 +1059,12 @@ wmic useraccount where "name='$user'" set PasswordExpires=false | Out-Null
 $admins = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
 net localgroup $admins $user /add 2>&1 | Out-Null
 
+# драйверы virtio (сеть, диск) — в хранилище драйверов; pnputil /add-driver есть с 1607, раньше — pnputil -i -a
+if (Test-Path C:\lsw\drivers) {
+    pnputil /add-driver C:\lsw\drivers\*.inf /subdirs /install
+    if ($LASTEXITCODE -ne 0) { Get-ChildItem C:\lsw\drivers -Recurse -Filter *.inf | ForEach-Object { pnputil -i -a $_.FullName } }
+}
+
 # OpenSSH Server
 if (Test-Path C:\lsw\OpenSSH-Win64.msi) {
     Start-Process msiexec.exe -Wait -ArgumentList '/i C:\lsw\OpenSSH-Win64.msi /qn'
@@ -1035,11 +1102,19 @@ windows_args() {
 			warn "общая папка для Windows требует samba на хосте: sudo apt install samba / sudo pacman -S samba"
 		fi
 	fi
-	ARGS+=(-cpu "${LSW_WIN_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic,hv_stimer}"
+	# просвещения Hyper-V: Windows видит гипервизор и не крутит таймеры/IPI/TLB-сбросы впустую — меньше CPU в простое
+	ARGS+=(-cpu "${LSW_WIN_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_synic,hv_stimer,hv_frequencies,hv_reset,hv_runtime,hv_tlbflush,hv_ipi}"
 		-rtc base=localtime
-		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap" -device ide-hd,drive=d0,bus=ide.0
-		-netdev "$net" -device e1000e,netdev=n0
+		-drive "file=$DIR/disk.qcow2,if=none,id=d0,$(disk_cache),discard=unmap,detect-zeroes=unmap"
+		-netdev "$net"
 		-vga std)
+	# virtio — только у VM, поставленных с драйверами virtio-win (WIN_VIRTIO=1, с 0.10). Старые VM
+	# остаются на SATA + e1000e: без драйвера viostor Windows с virtio-диска не загрузится
+	if [[ ${WIN_VIRTIO:-0} == 1 ]]; then
+		ARGS+=(-object iothread,id=io0 -device virtio-blk-pci,drive=d0,iothread=io0 -device virtio-net-pci,netdev=n0)
+	else
+		ARGS+=(-device ide-hd,drive=d0,bus=ide.0 -device e1000e,netdev=n0)
+	fi
 	if [[ $INSTALLED != 1 ]]; then
 		ARGS+=(-drive "file=$ISO,if=none,id=cd0,media=cdrom,readonly=on" -device ide-cd,drive=cd0,bus=ide.1
 			-drive "file=$DIR/wincfg.iso,if=none,id=cd1,media=cdrom,readonly=on" -device ide-cd,drive=cd1,bus=ide.2
@@ -1202,7 +1277,7 @@ cmd_install() {
 	local distro=${1:-}
 	[[ -n $distro ]] || die "lsw install <дистрибутив|файл.iso|windows> [имя] (дистрибутивы: ${LINUX_DISTROS// /, })"
 	shift
-	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64 manual=0
+	local name='' cpus='' mem='' disk='' share='' share_ro=0 pass='' user=${LSW_USER:-$USER} iso='' key=$WIN_GENERIC_KEY edition='' vnc='' lang='' arch=amd64 manual=0 novirtio=0
 	# lsw install файл.iso [имя] — что за система, смотрим по самому ISO
 	if [[ $distro == *.[iI][sS][oO] ]]; then
 		iso=$(iso_find "$distro") || die "нет файла $distro (ищу и в ${ISO_DIR/#"$HOME"/\~}; все ISO — lsw images)"
@@ -1227,6 +1302,7 @@ cmd_install() {
 			shift ;;
 		--vnc) vnc=1 ;;
 		--manual) manual=1 ;;
+		--no-virtio) novirtio=1 ;;
 		*) die "неизвестная опция: $1" ;;
 		esac
 		shift
@@ -1309,7 +1385,7 @@ cmd_install() {
 	# порт резервируем сразу: параллельная установка (tui) не должна взять тот же
 	{ flock 9; PORT=$(free_port); echo "$PORT" >"$DIR/port.reserve"; } 9>"$LSW_HOME/port.lock"
 	TYPE=$type DISTRO=$distro ARCH=$arch CPUS=$cpus MEM=$mem VMUSER=$user SHARE=$share SHARE_RO=$share_ro ISO=$iso INSTALLED=0
-	MANUAL=$manual INSTALL_UI=''
+	MANUAL=$manual INSTALL_UI='' WIN_VIRTIO=0
 
 	if ((manual)); then
 		DISTRO=$slug
@@ -1333,13 +1409,19 @@ cmd_install() {
 	else
 		[[ -n $lang ]] || lang=$(win_lang "$iso")
 		info "Windows ISO: язык $lang"
+		# virtio-диск и сеть быстрее SATA/e1000e и легче для CPU; драйверы — из virtio-win
+		if ((!novirtio)) && VIRTIO_DIR=$(virtio_win_drivers w10); then
+			WIN_VIRTIO=1
+		else
+			((novirtio)) || warn "ставлю без virtio: диск SATA, сеть e1000e (медленнее)"
+		fi
 		make_win_cfg "$iso" "$lang" "$key" "$edition"
 		qemu-img create -q -f qcow2 -o preallocation=metadata "$DIR/disk.qcow2" "$disk"
 	fi
 
 	local v
 	{
-		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED MANUAL INSTALL_UI; do printf '%s=%q\n' "$v" "${!v}"; done
+		for v in TYPE DISTRO ARCH CPUS MEM PORT VMUSER SHARE SHARE_RO ISO INSTALLED MANUAL INSTALL_UI WIN_VIRTIO; do printf '%s=%q\n' "$v" "${!v}"; done
 	} >"$DIR/vm.conf"
 	rm -f "$DIR/port.reserve"
 	[[ -n $(default_vm) ]] || echo "$name" >"$LSW_HOME/default"
@@ -1760,6 +1842,107 @@ cmd_code() { # [имя] [папка в госте] — VS Code через Remote
 	"$ed" --folder-uri "$uri"
 }
 
+# --- lsw gui: окна Linux-программ гостя прямо на рабочем столе хоста, как WSLg ---
+# Wayland — через waypipe (быстро, чётко), X11 — через ssh -Y (любые старые программы).
+# Когда есть оба, программа сама выбирает: GTK/Qt/Firefox — Wayland, остальные — X11.
+
+# выполняется в госте: ставит недостающее (waypipe, xauth), включает X11Forwarding в sshd,
+# печатает W=1 / X=1 — что работает. Аргументы: нужен waypipe, нужен X11, ставить ли пакеты
+GUI_GUEST=$(cat <<'EOF'
+W=$1 X=$2 inst=$3
+if [ "$(id -u)" = 0 ]; then S=''; elif sudo -n true 2>/dev/null; then S='sudo -n'; else S=no; fi
+pkg() { # пакет
+	if command -v apt-get >/dev/null; then
+		$S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$1" >/dev/null 2>&1 ||
+			{ $S apt-get update -q >/dev/null 2>&1; $S env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$1" >/dev/null 2>&1; }
+	elif command -v dnf >/dev/null; then
+		[ "$1" = xauth ] && set -- xorg-x11-xauth; $S dnf install -y -q "$1" >/dev/null 2>&1
+	elif command -v pacman >/dev/null; then
+		# в облачном образе Arch нет базы пакетов; на Arch только -Syu (частичное обновление ломает систему)
+		[ "$1" = xauth ] && set -- xorg-xauth
+		$S pacman -S --needed --noconfirm "$1" >/dev/null 2>&1 || $S pacman -Syu --needed --noconfirm "$1" >/dev/null 2>&1
+	elif command -v zypper >/dev/null; then $S zypper -n -q in "$1" >/dev/null 2>&1
+	elif command -v apk >/dev/null; then $S apk add -q "$1" >/dev/null 2>&1
+	else return 1; fi
+}
+if [ "$inst" = 1 ] && [ "$S" != no ]; then
+	[ "$W" = 1 ] && ! command -v waypipe >/dev/null && { echo "ставлю waypipe" >&2; pkg waypipe || echo "waypipe не поставился (нет в репозиториях гостя?)" >&2; }
+	[ "$X" = 1 ] && ! command -v xauth >/dev/null && { echo "ставлю xauth" >&2; pkg xauth || echo "xauth не поставился" >&2; }
+fi
+if [ "$X" = 1 ] && command -v xauth >/dev/null; then
+	sshd=$(command -v sshd || echo /usr/sbin/sshd)
+	if [ "$S" != no ] && ! $S "$sshd" -T 2>/dev/null | grep -qi '^x11forwarding yes'; then
+		# первое значение побеждает: drop-in подключается в начале sshd_config, раньше его X11Forwarding no
+		if grep -qsi '^[[:space:]]*Include[[:space:]]*/etc/ssh/sshd_config.d' /etc/ssh/sshd_config; then
+			echo 'X11Forwarding yes' | $S tee /etc/ssh/sshd_config.d/10-lsw-x11.conf >/dev/null
+		else
+			$S sed -i '1i X11Forwarding yes' /etc/ssh/sshd_config
+		fi
+		$S systemctl reload ssh 2>/dev/null || $S systemctl reload sshd 2>/dev/null || $S rc-service sshd reload >/dev/null 2>&1
+	fi
+	echo X=1
+fi
+command -v waypipe >/dev/null && echo W=1
+true
+EOF
+)
+
+cmd_gui() { # [имя] [--x11|--wayland] программа [аргументы...]
+	local name='' mode=auto out w=0 x=0 inst=0 a
+	if [[ -n ${1:-} && -f $(vm_dir "$1")/vm.conf ]]; then name=$1; shift; fi
+	while [[ ${1:-} == --* ]]; do
+		case $1 in
+		--x11) mode=x11 ;;
+		--wayland) mode=wayland ;;
+		--) shift; break ;;
+		*) die "неизвестная опция: $1 (lsw gui [имя] [--x11|--wayland] программа)" ;;
+		esac
+		shift
+	done
+	(($#)) || die "какую программу открыть? lsw gui [имя] программа [аргументы], например: lsw gui ubuntu gedit"
+	load_vm "$(resolve_name "$name")"
+	[[ $TYPE == linux ]] || die "окна программ — только для Linux-гостей; экран Windows целиком: lsw install ... --vnc"
+	# что может хост
+	local hw=0 hx=0
+	[[ $mode != x11 && -n ${WAYLAND_DISPLAY:-} ]] && command -v waypipe >/dev/null && hw=1
+	[[ $mode != wayland && -n ${DISPLAY:-} ]] && command -v xauth >/dev/null && hx=1
+	if ((!hw && !hx)); then
+		if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then die "нет графической сессии (WAYLAND_DISPLAY/DISPLAY) — запусти из терминала на рабочем столе"; fi
+		[[ $mode == x11 ]] && die "для X11 на хосте нужен xauth и DISPLAY (Xwayland)"
+		die "на хосте нет waypipe: $(command -v pacman >/dev/null && echo 'sudo pacman -S waypipe' || echo 'sudo apt install waypipe')"
+	fi
+	((hw)) || [[ $mode == x11 ]] || [[ -z ${WAYLAND_DISPLAY:-} ]] ||
+		warn "на хосте нет waypipe — окна пойдут через X11 (медленнее). Быстрее: $(command -v pacman >/dev/null && echo 'sudo pacman -S waypipe' || echo 'sudo apt install waypipe')"
+	ensure_up
+	ssh_opts
+	# пакеты в госте ставим один раз (и после смены режима); дальше только проверка — один быстрый ssh
+	[[ ${GUI_SETUP:-} == "$hw$hx" || ${GUI_SETUP:-} == 11 ]] || inst=1
+	((inst)) && info "готовлю $NAME к окнам: $( ((hw)) && printf waypipe)$( ((hw && hx)) && printf ' + ')$( ((hx)) && printf 'X11')"
+	out=$("${SSH[@]}" "$VMUSER@127.0.0.1" "sh -s $hw $hx $inst" <<<"$GUI_GUEST") || die "не удалось подготовить гостя"
+	[[ $out == *W=1* ]] && ((hw)) && w=1
+	[[ $out == *X=1* ]] && ((hx)) && x=1
+	if ((!w && !x)); then
+		die "в госте не поставились ни waypipe, ни xauth (нет сети или sudo?). Поставь их пакетным менеджером гостя (lsw shell $NAME) и запусти ещё раз"
+	fi
+	((inst)) && conf_set GUI_SETUP "$hw$hx" # хоть что-то работает — больше не ставим
+	((hw && !w)) && [[ $mode != wayland ]] && info "в госте нет waypipe — окна через X11"
+	# сессия без общего мастер-соединения: X11 и сокет waypipe — свои для каждого запуска
+	ssh_opts nomux
+	local cmd=() q=()
+	# через login-шелл гостя: PATH из ~/.profile (~/.local/bin, /snap/bin)
+	if (($# == 1)) && [[ $1 == *[[:space:]\;\|\&\$]* ]]; then cmd=(sh -lc "$1") # строка для шелла, как в lsw run
+	else cmd=(sh -lc 'exec "$@"' lsw "$@"); fi
+	for a in "${cmd[@]}"; do q+=("$(printf %q "$a")"); done
+	local ssh=("${SSH[@]}")
+	((x)) && ssh+=(-Y)
+	info "$NAME: $1 ($( ((w)) && printf Wayland)$( ((w && x)) && printf ' + ')$( ((x)) && printf X11))"
+	if ((w)); then
+		# -n: у гостя нет GPU — только общая память; -c none: это localhost, сжатие лишь тратит CPU
+		exec waypipe -n -c none --title-prefix "[$NAME] " ssh "${ssh[@]:1}" "$VMUSER@127.0.0.1" "${q[@]}"
+	fi
+	exec "${ssh[@]}" "$VMUSER@127.0.0.1" "${q[@]}"
+}
+
 parse_share() { # DIR[:ro] -> PSHARE, PSHARE_RO
 	local spec=$1
 	PSHARE_RO=0
@@ -2149,12 +2332,14 @@ cmd_upgrade() { # [--check] [--from lsw-*.tar.gz]
 
 ESC=$'\e'
 
-t_pad() { # текст ширина -> ровно ширина символов (не байт: printf %-Ns считает байты)
+t_padv() { # текст ширина -> P: ровно ширина символов (не байт: printf %-Ns считает байты). Без подоболочки
 	local s=$1 w=$2
+	P=''
 	((w > 0)) || return 0
 	((${#s} > w)) && s="${s:0:w-1}…"
-	printf '%s%*s' "$s" $((w - ${#s})) ''
+	printf -v P '%s%*s' "$s" $((w - ${#s})) ''
 }
+t_pad() { local P; t_padv "$@"; printf '%s' "$P"; }
 
 t_rep() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
 
@@ -2251,6 +2436,7 @@ t_reap() { # закончившиеся фоновые задачи -> стро�
 		elif ((T_MSGC == 2)); then T_MSG="$n: ${T_JOBWHAT[$n]} — готово"; fi
 		rm -f "${T_JOBLOG[$n]}"
 		unset "T_JOB[$n]" "T_JOBLOG[$n]" "T_JOBWHAT[$n]" "T_INST[$n]"
+		T_DTIME=0 # задача могла поменять снимки, диск, порты
 	done
 }
 
@@ -2389,20 +2575,41 @@ t_pick() { # заголовок пункт... -> PICK (номер пункта),
 
 t_conf() { (load_vm "$1" 2>/dev/null && echo "${!2:-}"); } # имя переменная -> значение из vm.conf
 
-t_load() { # список VM и их состояния; выделение держится за имя
-	local d n i
+t_pid() { # каталог VM -> T_PID, если QEMU жив (как qemu_pid, но без подпроцессов)
+	local c
+	T_PID=''
+	[[ -f $1/qemu.pid ]] && read -r T_PID <"$1/qemu.pid" 2>/dev/null && [[ $T_PID =~ ^[0-9]+$ ]] &&
+		read -r c <"/proc/$T_PID/comm" 2>/dev/null && [[ $c == qemu* ]] && return 0
+	T_PID=''
+	return 1
+}
+
+t_proc() { # каталог VM -> T_UP (с) и T_RSS (КиБ) запущенного QEMU, из /proc без ps
+	local st up f
+	T_UP=0 T_RSS=0
+	t_pid "$1" || return 0
+	read -r up _ </proc/uptime
+	read -r st <"/proc/$T_PID/stat" || return 0
+	read -ra f <<<"${st##*) }" # после «(comm) »: f[0] — поле 3, starttime (поле 22) — f[19]
+	T_UP=$((${up%.*} - f[19] / T_HZ))
+	while read -r st up _; do [[ $st == VmRSS: ]] && { T_RSS=$up; break; }; done <"/proc/$T_PID/status"
+}
+
+t_load() { # список VM и их состояния; выделение держится за имя. Раз в 2 с — без подпроцессов
+	local d n i l inst distro arch s
 	T_NAMES=() T_INFO=()
-	T_DEF=$(default_vm)
+	T_DEF=''
+	[[ -f $LSW_HOME/default ]] && read -r T_DEF <"$LSW_HOME/default"
 	for d in "$VMS"/*/; do
 		[[ -f $d/vm.conf ]] || continue
-		n=$(basename "$d")
+		n=${d%/} n=${n##*/} inst=0 distro='' arch=amd64
+		while IFS= read -r l; do
+			case $l in INSTALLED=*) inst=${l#*=} ;; DISTRO=*) distro=${l#*=} ;; ARCH=*) arch=${l#*=} ;; esac
+		done <"$d/vm.conf"
+		s=stopped
+		if t_pid "$d"; then [[ $inst == 1 ]] && s=running || s=installing; fi
 		T_NAMES+=("$n")
-		T_INFO+=("$(
-			load_vm "$n" 2>/dev/null
-			s=stopped
-			if is_running; then [[ $INSTALLED == 1 ]] && s=running || s=installing; fi
-			echo "$s $DISTRO$([[ $ARCH == arm64 ]] && echo /arm64)"
-		)")
+		T_INFO+=("$s $distro$([[ $arch == arm64 ]] && echo /arm64)")
 	done
 	for n in "${!T_INST[@]}"; do # ставятся из tui, vm.conf ещё нет
 		[[ -f $(vm_dir "$n")/vm.conf ]] && continue
@@ -2442,12 +2649,9 @@ t_detail() { # имя -> строки "вид|текст" для правой п
 		fi
 		load_vm "$1" 2>/dev/null || exit 0
 		FWDS=${FWDS:-}
-		local pid up rss sz share f p a h g snaps
-		if pid=$(qemu_pid); then
-			up=$(ps -o etimes= -p "$pid" | tr -d ' ')
-			rss=$(ps -o rss= -p "$pid" | tr -d ' ')
-			if [[ $INSTALLED == 1 ]]; then echo "S|1|запущена · $(t_dur "$up") · $((rss / 1024)) MiB на хосте"
-			else echo "S|2|устанавливается · $(t_dur "$up")"; fi
+		local sz share f p a h g snaps
+		if qemu_pid >/dev/null; then # время и память подставит t_draw: они меняются, а остальное кэшируется
+			if [[ $INSTALLED == 1 ]]; then echo "S|1|LIVE"; else echo "S|2|LIVE"; fi
 		else
 			echo "S|0|остановлена"
 		fi
@@ -2481,16 +2685,16 @@ t_detail() { # имя -> строки "вид|текст" для правой п
 	)
 }
 
-t_hints() { # ширина -> строка подсказок, сколько влезет
+t_hints() { # ширина -> P: строка подсказок, сколько влезет
 	local w=$1 out='' len=0 i k l
-	local hk=('?' помощь q выход '↵' shell s старт/стоп r рестарт e ресурсы p порты n снимки f папка v code c консоль l логи '*' основная i новая d удалить)
+	local hk=('?' помощь q выход '↵' shell s старт/стоп r рестарт e ресурсы p порты n снимки f папка v code w окно c консоль l логи '*' основная i новая d удалить)
 	for ((i = 0; i < ${#hk[@]}; i += 2)); do
 		k=${hk[i]} l=${hk[i + 1]}
 		((len + ${#k} + ${#l} + 3 > w)) && break
 		out+=" $ESC[1;36m$k$ESC[0m $ESC[2m$l$ESC[0m "
 		len=$((len + ${#k} + ${#l} + 3))
 	done
-	printf '%s' "$out"
+	P=$out
 }
 
 t_draw() {
@@ -2510,32 +2714,51 @@ t_draw() {
 		[[ -n ${T_JOB[$n]:-} ]] && dot="$ESC[36m⋯"
 		[[ $n == "$T_DEF" ]] && mark='* ' || mark='  '
 		((i == T_SEL)) && sel="$ESC[7m" || sel=''
-		L+=("$sel $dot$ESC[39m $(t_pad "$mark$n" $((lw - 18))) $(t_pad "$ds" 13) $ESC[0m")
+		t_padv "$mark$n" $((lw - 18)); a=$P
+		t_padv "$ds" 13
+		L+=("$sel $dot$ESC[39m $a $P $ESC[0m")
 	done
 	((${#T_NAMES[@]})) || L=("" "$(t_pad '  VM пока нет' "$lw")" "" "$(t_pad '  i — установить' "$lw")")
 
 	if [[ -n $T_CUR ]]; then
-		R+=("$ESC[1m$(t_pad "$T_CUR$([[ $T_CUR == "$T_DEF" ]] && echo '  (по умолчанию)')" "$rw")$ESC[0m")
-		[[ -n ${T_JOB[$T_CUR]:-} ]] && R+=("$ESC[36m$(t_pad "⋯ ${T_JOBWHAT[$T_CUR]}…" "$rw")$ESC[0m")
-		while IFS='|' read -r k a b; do
+		a=$T_CUR
+		[[ $T_CUR == "$T_DEF" ]] && a+='  (по умолчанию)'
+		t_padv "$a" "$rw"
+		R+=("$ESC[1m$P$ESC[0m")
+		[[ -n ${T_JOB[$T_CUR]:-} ]] && t_padv "⋯ ${T_JOBWHAT[$T_CUR]}…" "$rw" && R+=("$ESC[36m$P$ESC[0m")
+		# qemu-img, du и прочее — не чаще раза в 10 с (и сразу после клавиши); ход установки — каждый раз
+		st=${T_INFO[T_SEL]%% *}
+		if [[ $T_DKEY != "$T_CUR|$st" ]] || ((EPOCHSECONDS - T_DTIME >= 10)) || [[ $st != running && $st != stopped || -n ${T_JOB[$T_CUR]:-} ]]; then
+			mapfile -t T_DLINES < <(t_detail "$T_CUR")
+			T_DKEY="$T_CUR|$st" T_DTIME=$EPOCHSECONDS
+		fi
+		for line in "${T_DLINES[@]}"; do
+			IFS='|' read -r k a b <<<"$line"
 			case $k in
 			S)
 				case $a in 1) dot="$ESC[32m●" ;; 2) dot="$ESC[33m◐" ;; *) dot="$ESC[90m○" ;; esac
-				R+=("$dot $(t_pad "$b" $((rw - 2)))$ESC[0m") ;;
-			K) R+=("$ESC[2m$(t_pad "$a" 9)$ESC[0m$(t_pad "$b" $((rw - 9)))") ;;
-			H) R+=("$ESC[1;36m$(t_pad "$a" "$rw")$ESC[0m") ;;
-			T) R+=("  $(t_pad "$a" $((rw - 2)))") ;;
-			D) R+=("  $ESC[2m$(t_pad "$a" $((rw - 2)))$ESC[0m") ;;
-			L) R+=("  $ESC[2m$(t_pad "$a${b:+|$b}" $((rw - 2)))$ESC[0m") ;;
+				if [[ $b == LIVE ]]; then
+					t_proc "$VMS/$T_CUR"
+					if ((a == 1)); then b="запущена · $(t_dur "$T_UP") · $((T_RSS / 1024)) MiB на хосте"
+					else b="устанавливается · $(t_dur "$T_UP")"; fi
+				fi
+				t_padv "$b" $((rw - 2)); R+=("$dot $P$ESC[0m") ;;
+			K) t_padv "$a" 9; a=$P; t_padv "$b" $((rw - 9)); R+=("$ESC[2m$a$ESC[0m$P") ;;
+			H) t_padv "$a" "$rw"; R+=("$ESC[1;36m$P$ESC[0m") ;;
+			T) t_padv "$a" $((rw - 2)); R+=("  $P") ;;
+			D) t_padv "$a" $((rw - 2)); R+=("  $ESC[2m$P$ESC[0m") ;;
+			L) t_padv "$a${b:+|$b}" $((rw - 2)); R+=("  $ESC[2m$P$ESC[0m") ;;
 			B) R+=("") ;;
 			esac
-		done < <(t_detail "$T_CUR")
+		done
 	fi
 
-	o="$ESC[H$ESC[1;7m$(t_pad " lsw $LSW_VERSION · ${#T_NAMES[@]} VM, запущено $run" "$W")$ESC[0m$ESC[K"
+	t_padv " lsw $LSW_VERSION · ${#T_NAMES[@]} VM, запущено $run" "$W"
+	o="$ESC[H$ESC[1;7m$P$ESC[0m$ESC[K"
 	if ((W >= 72)); then
+		t_padv '' "$lw"
 		for ((r = 0; r < body; r++)); do
-			line=${L[r]:-$(t_pad '' "$lw")}
+			line=${L[r]:-$P}
 			o+=$'\n'"$line $ESC[90m│$ESC[0m ${R[r]:-}$ESC[K"
 		done
 	else # узкий терминал: список, под ним подробности
@@ -2543,9 +2766,11 @@ t_draw() {
 		for line in "${R[@]}"; do D+=(" $line"); done
 		for ((r = 0; r < body; r++)); do o+=$'\n'"${D[r]:-}$ESC[K"; done
 	fi
-	o+=$'\n'"$(t_hints "$W")$ESC[K"
+	t_hints "$W"
+	o+=$'\n'"$P$ESC[K"
 	case $T_MSGC in 1) line="$ESC[31m" ;; 2) line="$ESC[32m" ;; *) line="$ESC[33m" ;; esac
-	o+=$'\n'"$line$(t_pad " $T_MSG" $((W - 1)))$ESC[0m$ESC[K"
+	t_padv " $T_MSG" $((W - 1))
+	o+=$'\n'"$line$P$ESC[0m$ESC[K"
 	printf '%s' "$o"
 }
 
@@ -2676,6 +2901,18 @@ t_install_job() { # имя подпись команда... — установк
 	t_msg 3 "$n: установка… (ход — справа, d — прервать)"
 }
 
+t_gui() { # имя — программа гостя в окне хоста (lsw gui); не задача VM: окно живёт сколько угодно
+	local n=$1 log
+	[[ $(t_conf "$n" TYPE) == linux ]] || { t_msg 1 "$n: окна программ — только для Linux-гостей"; return; }
+	t_prompt "Программа в $n (окно откроется на рабочем столе): " "$(t_conf "$n" GUI_LAST)" || return
+	[[ -n $REPLY ]] || return
+	(load_vm "$n" && conf_set GUI_LAST "$REPLY")
+	log=$LSW_HOME/logs/gui-$n.log
+	mkdir -p "${log%/*}"
+	setsid "$SELF" gui "$n" "$REPLY" </dev/null >"$log" 2>&1 &
+	t_msg 2 "$n: $REPLY — окно скоро появится; если нет — ${log/#"$HOME"/\~}"
+}
+
 t_abort_install() { # имя — прервать установку из tui и удалить VM
 	local n=$1 pid=${T_JOB[$1]}
 	t_confirm "Прервать установку $n и удалить VM?" || return
@@ -2783,6 +3020,7 @@ t_help() {
 		"c          серийная консоль (выход Ctrl+])" \
 		"l          лог консоли (выход Ctrl+C)" \
 		"v          открыть в VS Code (Remote-SSH)" \
+		"w          программа гостя в окне на рабочем столе (lsw gui)" \
 		"*          сделать VM основной (lsw без имени)" \
 		"i          новая VM из образа (там: u — скачать, d — удалить)" \
 		"d          удалить VM (во время установки — прервать её)" \
@@ -2795,7 +3033,8 @@ cmd_tui() {
 	[[ $(locale charmap 2>/dev/null) == UTF-8 ]] || export LC_ALL=C.UTF-8
 	SELF=$(readlink -f "$0")
 	declare -gA T_JOB=() T_JOBLOG=() T_JOBWHAT=() T_INST=()
-	T_SEL=0 T_CUR=$(default_vm) T_DEF='' T_MSG='' T_MSGC=2 T_KEY='' PICK=0
+	T_SEL=0 T_CUR=$(default_vm) T_DEF='' T_MSG='' T_MSGC=2 T_KEY='' PICK=0 T_DKEY='' T_DTIME=0 T_DLINES=()
+	T_HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
 	ensure_key
 	trap 't_screen off' EXIT
 	trap ':' WINCH
@@ -2808,6 +3047,7 @@ cmd_tui() {
 		reload=1
 		t_draw
 		t_key 2 || continue # раз в 2 с — обновить состояния
+		T_DTIME=0 # после любого действия правая панель перечитывается полностью
 		n=$T_CUR st=${T_INFO[T_SEL]%% *}
 		case $T_KEY in
 		up | k) ((T_SEL > 0)) && ((T_SEL--)); reload=0 ;;
@@ -2832,7 +3072,7 @@ cmd_tui() {
 				case $T_KEY in
 				d | x) t_abort_install "$n" ;;
 				enter | l) [[ $st == creating ]] && t_msg 3 "$n ещё создаётся — ход установки справа" || t_ext "$SELF" logs "$n" ;;
-				s | r | e | p | n | f | c | v | '*') t_msg 3 "$n ещё ставится — подожди (d — прервать)" ;;
+				s | r | e | p | n | f | c | v | w | '*') t_msg 3 "$n ещё ставится — подожди (d — прервать)" ;;
 				esac
 				((reload)) || T_CUR=${T_NAMES[T_SEL]:-}
 				continue
@@ -2856,6 +3096,7 @@ cmd_tui() {
 				else t_ext "$SELF" console "$n"; fi ;;
 			l) t_ext "$SELF" logs "$n" ;;
 			v) t_bg "$n" "VS Code" code "$n" ;;
+			w) t_gui "$n" ;;
 			'*') t_do default "$n" ;;
 			d | x) t_confirm "Удалить VM $n вместе с диском и снимками?" && t_bg "$n" удаление rm "$n" -f ;;
 			esac
@@ -2897,6 +3138,7 @@ main() {
 	default) load_vm "${1:?имя}" && echo "$1" >"$LSW_HOME/default" && info "по умолчанию: $1" ;;
 	ssh-config) cmd_ssh_config "$@" ;;
 	code | vscode) cmd_code "$@" ;;
+	gui) cmd_gui "$@" ;;
 	share) cmd_share "$@" ;;
 	set) cmd_set "$@" ;;
 	port | ports) cmd_port "$@" ;;

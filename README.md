@@ -59,7 +59,7 @@ lsw stop --all
 lsw tui        # или просто lsw, если VM по умолчанию ещё нет
 ```
 ```
- lsw 0.9.1 · 3 VM, запущено 1
+ lsw 0.10.0 · 3 VM, запущено 1
  ○   armbox       ubuntu/arm64   │ dev  (по умолчанию)
  ● * dev          ubuntu         │ ● запущена · 1:02:13 · 812 MiB на хосте
  ○   win          windows        │ Система  ubuntu · linux · amd64
@@ -245,6 +245,11 @@ lsw достаёт из ISO ядро, грузит установщик с `auto
   ширина 80 колонок. Лучше брать ISO 22H2 — lsw помечает старые ISO в списке образов и предупреждает при установке.
 - Редакция выбирается generic-ключом Pro (установка без активации). Свой ключ — `--key`, другая редакция — `--edition N`
   (индекс в `install.wim`/`esd`, посмотреть: `wiminfo` из `wimlib`).
+- Диск и сеть — virtio (быстрее и легче для CPU, чем эмуляция SATA и e1000e). Драйверы lsw берёт из
+  [virtio-win](https://github.com/virtio-win/virtio-win-pkg-scripts): один раз скачивает ISO (~850 МБ), оставляет из него
+  несколько МБ драйверов в кэше, а сам ISO удаляет. Без интернета положи `virtio-win*.iso` в `~/ISO`.
+  Если драйверы взять негде, или с `--no-virtio`, Windows ставится на SATA + e1000e. VM, поставленные до 0.10,
+  остаются на SATA: переключить готовую систему на virtio нельзя (не загрузится без драйвера диска).
 - Посмотреть экран установки, если что-то пошло не так: `lsw install windows --iso ... --vnc`, затем
   `vncviewer 127.0.0.1:59xx`.
 - Если Windows виснет на загрузке (бывает с гибридными CPU Intel), попробуй `LSW_WIN_CPU=host lsw start windows` или
@@ -262,6 +267,25 @@ lsw code dev /srv/app    # VM и папка в госте
 строку `Include ~/.local/share/lsw/ssh_config` — там хосты `lsw-<имя>` всех VM, lsw обновляет их сам при установке и удалении.
 Свои записи в `~/.ssh/config` не трогаются. Другой редактор: `LSW_EDITOR=cursor lsw code` (поддерживаются `code`,
 `code-insiders`, `cursor`, `codium`, `code-oss`; для двух последних — расширение open-remote-ssh).
+
+## Окна программ гостя (как WSLg)
+
+`lsw gui` открывает Linux-программу из VM обычным окном на рабочем столе хоста — без VNC и без рабочего стола в госте.
+
+```sh
+lsw gui gedit                    # в VM по умолчанию
+lsw gui dev firefox              # VM и программа
+lsw gui dev 'cd /mnt/host && meld a b'   # одна строка — для шелла гостя, как в lsw run
+lsw gui dev --x11 xterm          # только X11 (--wayland — только Wayland)
+```
+Окна идут по ssh двумя путями сразу, программа сама выбирает подходящий:
+- **Wayland** через [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) — быстро и чётко (GTK, Qt, Firefox, Chromium).
+  Нужен на хосте: `sudo pacman -S waypipe` / `sudo apt install waypipe`.
+- **X11** через `ssh -Y` и Xwayland хоста — для любых старых программ, но медленнее.
+
+При первом запуске lsw сам ставит в гостя `waypipe` и `xauth` и включает `X11Forwarding` в sshd; заголовки окон
+начинаются с `[имя VM]`. Программы в госте ставятся как обычно (`lsw run dev -- sudo apt install gedit`).
+Ускорения 3D нет — у гостя нет GPU, рисует процессор. В `lsw tui` — клавиша `w`. Для Windows-гостей — только экран целиком по VNC.
 
 ## Работа с другими инструментами
 
